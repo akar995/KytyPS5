@@ -118,7 +118,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
 	auto&      state  = ctx.state;
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
-	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
+	const auto ballot = EmitHostBallot(state, exec);
 	if (ctx.half != 0) {
 		lane = EmitAndConstant(state, lane, 31);
 	}
@@ -800,6 +800,20 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
+	if (SplitsHostSubgroup(ctx.state)) {
+		// Votes within the caller's guest wave: All compares with the half's active lanes.
+		auto&      state = ctx.state;
+		const auto word  = [&](uint32_t value) {
+			const auto bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits,
+			                          EmitHostBallot(state, value), 0);
+			return bits;
+		};
+		const auto votes = word(predicate);
+		return zero ? Binary(state, spv::OpIEqual, TypeBool(state), votes,
+		                     word(ConstantBool(state, true)))
+		            : Binary(state, spv::OpINotEqual, TypeBool(state), votes, ConstantU32(state, 0));
+	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
 	                              TypeBool(ctx.state), result,
@@ -828,6 +842,13 @@ uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = EmitUMin32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
 	}
 	const auto result = state.builder.AllocateId();
+	if (SplitsHostSubgroup(state)) {
+		// The minimum of the caller's 32-lane guest wave.
+		state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,
+		                          ConstantU32(state, spv::ScopeSubgroup),
+		                          spv::GroupOperationClusteredReduce, value, ConstantU32(state, 32));
+		return result;
+	}
 	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
 	return result;

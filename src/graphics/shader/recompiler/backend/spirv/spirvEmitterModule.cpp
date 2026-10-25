@@ -585,7 +585,10 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	const auto& sub = state.program.info;
+	if (sub.subgroup_local_invocation_id ||
+	    (SplitsHostSubgroup(state) && (sub.subgroup_ballot || sub.subgroup_vote ||
+	                                   sub.subgroup_shuffle || sub.subgroup_arithmetic))) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -802,8 +805,12 @@ void DefineModule(EmitterState& state) {
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot ||
+	    (SplitsHostSubgroup(state) && state.program.info.subgroup_vote)) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	}
+	if (SplitsHostSubgroup(state) && state.program.info.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformClustered);
 	}
 	if (state.program.info.subgroup_vote) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);

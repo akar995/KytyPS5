@@ -51,7 +51,12 @@ static void RgdLabel(vk::CommandBuffer command, const char* kind, uint64_t a, ui
 	              static_cast<unsigned long long>(b));
 	vk::DebugUtilsLabelEXT label {};
 	label.pLabelName = text;
-	command.insertDebugUtilsLabelEXT(&label);
+	command.beginDebugUtilsLabelEXT(&label);
+}
+
+static void RgdLabelEnd(vk::CommandBuffer command) { // PERF-INSTR
+	static const bool enabled = std::getenv("KYTY_RGD_LABELS") != nullptr;
+	if (enabled) command.endDebugUtilsLabelEXT();
 }
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
@@ -481,6 +486,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		RgdLabel(vk_buffer, "CS", program.shader_hash, 0u); // PERF-INSTR
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		RgdLabelEnd(vk_buffer); // PERF-INSTR
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
@@ -556,6 +562,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	RgdLabel(vk_buffer, "CS", program.shader_hash, 1u); // PERF-INSTR
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	RgdLabelEnd(vk_buffer); // PERF-INSTR
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

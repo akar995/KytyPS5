@@ -37,6 +37,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <utility>
 #include <vector>
 
 #ifdef min
@@ -1007,6 +1008,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// [start, end) of each written image range; end becomes the running maximum after sorting.
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> written_images;
+	bool                                                    written_images_built = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -1015,18 +1019,35 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		if (!written_images_built) {
+			written_images_built = true;
+			written_images.clear();
 			for (const auto id: m_bound_images) {
 				const auto& image = m_context.GetTextureCache().m_slot_images[id];
 				if (!image.binding.shader_write && !image.binding.is_target) continue;
 				for (const auto written: {image.info.data, image.info.stencil,
 				                          image.info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						written_images.emplace_back(written.address, written.address + written.size);
 					}
 				}
 			}
+			std::ranges::sort(written_images);
+			uint64_t end = 0;
+			for (auto& range: written_images) {
+				end          = std::max(end, range.second);
+				range.second = end;
+			}
+		}
+		for (const auto [address, size]: reads) {
+			// Of the ranges starting before the read ends, the last holds the furthest end.
+			const auto after = std::ranges::lower_bound(written_images, address + size, {},
+			                                            &std::pair<uint64_t, uint64_t>::first);
+			if (size != 0 && after != written_images.begin() && std::prev(after)->second > address) {
+				EXIT("scalar resource reads overlap an image or attachment write\n");
+			}
+		}
+		for (const auto [address, size]: reads) {
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = writer->runtime->module->info;
 				for (const auto& resource: program.info.buffers) {

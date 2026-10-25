@@ -30,6 +30,9 @@
 #include <utility>
 #include <vector>
 
+#include <windows.h> // PERF-INSTR
+#include <chrono> // PERF-INSTR
+#include <cstdio> // PERF-INSTR
 namespace Libs::Graphics {
 
 namespace {
@@ -495,6 +498,20 @@ void BufferCache::InvalidateWriteFault(uint64_t vaddr) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	if (static const double after = [] { const char* t = std::getenv("KYTY_DL_LOG"); return t ? std::atof(t) : -1.0; }(); after >= 0.0) { // PERF-INSTR
+		static const auto start = std::chrono::steady_clock::now(); // PERF-INSTR
+		static std::atomic<int> logged {0}; // PERF-INSTR
+		if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= after && logged.fetch_add(1) < 400) { // PERF-INSTR
+			void* frames[10] {}; // PERF-INSTR
+			const auto count = RtlCaptureStackBackTrace(0, 10, frames, nullptr); // PERF-INSTR
+			const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)); // PERF-INSTR
+			const int near16 = GuestGpu::IsGpuThread() ? (m_gpu_modified_ranges.Intersects(vaddr & ~uint64_t {15}, 32) ? 1 : 0) : -1; // PERF-INSTR
+			const int page = GuestGpu::IsGpuThread() ? (m_gpu_modified_ranges.Intersects(vaddr & ~uint64_t {TRACKER_PAGE_SIZE - 1}, TRACKER_PAGE_SIZE) ? 1 : 0) : -1; // PERF-INSTR
+			std::fprintf(stderr, "DL addr=%llx size=%llx write=%d gpu=%d near=%d page=%d queued=%d stack:", (unsigned long long)vaddr, (unsigned long long)size, is_write ? 1 : 0, GuestGpu::IsGpuThread() ? 1 : 0, near16, page, GuestGpu::IsGpuThread() ? (HasQueuedDownload(vaddr, 1) ? 1 : 0) : -1); // PERF-INSTR
+			for (USHORT f = 0; f < count; f++) std::fprintf(stderr, " %llx", (unsigned long long)(reinterpret_cast<uintptr_t>(frames[f]) - base)); // PERF-INSTR
+			std::fprintf(stderr, "\n"); // PERF-INSTR
+		} // PERF-INSTR
+	} // PERF-INSTR
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

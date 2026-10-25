@@ -166,12 +166,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
+	// The emitted subgroup operations treat the host subgroup as one guest wave.
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_sizes[4] {};
 	uint32_t                          shader_stage_count = 0;
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-			                                       .module = stage->module,
-			                                       .pName  = "main"};
+			const auto native    = NativeShaderStage(stage->info.stage);
+			const auto wave_size = stage->info.wave_size;
+			auto&      info      = shader_stages[shader_stage_count];
+			info = {.stage = native, .module = stage->module, .pName = "main"};
+			if (graphics.compute_subgroup_size_control_enabled &&
+			    (graphics.required_subgroup_size_stages & native) &&
+			    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+				subgroup_sizes[shader_stage_count].requiredSubgroupSize = wave_size;
+				info.pNext = &subgroup_sizes[shader_stage_count];
+			}
+			shader_stage_count++;
 		}
 	}
 	if (rect_list) {

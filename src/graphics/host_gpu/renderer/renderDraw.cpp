@@ -57,7 +57,12 @@ static void RgdLabel(vk::CommandBuffer command, const char* kind, uint64_t a, ui
 	              static_cast<unsigned long long>(b));
 	vk::DebugUtilsLabelEXT label {};
 	label.pLabelName = text;
-	command.insertDebugUtilsLabelEXT(&label);
+	command.beginDebugUtilsLabelEXT(&label);
+}
+
+static void RgdLabelEnd(vk::CommandBuffer command) { // PERF-INSTR
+	static const bool enabled = std::getenv("KYTY_RGD_LABELS") != nullptr;
+	if (enabled) command.endDebugUtilsLabelEXT();
 }
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
@@ -1232,6 +1237,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	RgdLabelEnd(vk_buffer); // PERF-INSTR
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

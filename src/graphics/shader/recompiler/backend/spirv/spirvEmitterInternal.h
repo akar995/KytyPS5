@@ -406,6 +406,13 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state);
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
+// Wave32 graphics programs whose host subgroup may hold 64 lanes: each 32-lane half is one guest
+// wave (pixel, vertex and mesh stages cannot require a subgroup size on every driver).
+[[nodiscard]] bool SplitsHostSubgroup(const EmitterState& state);
+// A ballot of the caller's guest wave: with a split host subgroup, its half in the low word.
+uint32_t EmitHostBallot(EmitterState& state, uint32_t predicate);
+// Reads `value` from a lane of the caller's guest wave.
+uint32_t EmitHostShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane);
 
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 

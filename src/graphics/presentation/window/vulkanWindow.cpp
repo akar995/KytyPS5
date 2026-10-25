@@ -592,6 +592,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
 
+	std::fprintf(stderr, "SUBGROUP default=%u min=%u max=%u stages=0x%08x\n", graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size, static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages)); // PERF-INSTR
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),

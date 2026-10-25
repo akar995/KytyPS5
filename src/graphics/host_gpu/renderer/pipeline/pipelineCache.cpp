@@ -117,6 +117,15 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// PERF-INSTR: KYTY_DUMP_HASH selects one guest shader to dump.
+bool DumpHashMatches(uint64_t hash) {
+	static const uint64_t wanted = [] {
+		const char* text = std::getenv("KYTY_DUMP_HASH");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+	}();
+	return wanted != 0 && hash == wanted;
+}
+
 void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
@@ -318,6 +327,12 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	if (DumpHashMatches(key.hash)) { // PERF-INSTR
+		const auto base = fmt::format("C:/Users/akari/AppData/Local/Temp/claude/d--ps5-emulator-code-KytyPS5/d8beb6e6-00f1-41ce-ad41-50571e7f41b9/scratchpad/dumps/{}_{:016x}_{:016x}", stage, key.hash, id); // PERF-INSTR
+		std::filesystem::create_directories(std::filesystem::path(base).parent_path()); // PERF-INSTR
+		if (auto* f = std::fopen((base + ".spv").c_str(), "wb")) { std::fwrite(result.spirv.data(), 4, result.spirv.size(), f); std::fclose(f); } // PERF-INSTR
+		if (auto* f = std::fopen((base + ".ir.txt").c_str(), "wb")) { std::fputs(result.decoded_dump.c_str(), f); std::fputs("\n==== IR ====\n", f); std::fputs(result.ir_dump.c_str(), f); std::fclose(f); } // PERF-INSTR
+	} // PERF-INSTR
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
@@ -409,7 +424,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+	                          DumpHashMatches(params.hash); // PERF-INSTR
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
