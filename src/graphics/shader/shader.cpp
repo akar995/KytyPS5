@@ -14,11 +14,15 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -152,6 +156,43 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
+
+	// Copy the tables once. A table often shares a page with GPU-written data; dereferencing it
+	// would fault into a full GPU readback even though its own bytes are CPU-written.
+	const auto read_table = [](const uint32_t* table, uint32_t* out, uint32_t count) {
+		if (count == 0) {
+			return;
+		}
+		const auto address = reinterpret_cast<uint64_t>(table);
+		const auto bytes   = count * sizeof(uint32_t);
+		if (Libs::LibKernel::Memory::IsGpuResourceHelper()) {
+			// A helper cannot fault into the GPU thread: a GPU-written table blocks the
+			// evaluation, which the GPU thread then repeats itself.
+			if (Libs::LibKernel::Memory::GpuReadableEnd(address) < address + bytes ||
+			    !Libs::LibKernel::Memory::TryReadBacking(address, out, bytes)) {
+				Libs::LibKernel::Memory::BlockGpuResourceHelper();
+				std::memset(out, 0, bytes);
+			}
+			return;
+		}
+		if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, out, bytes)) {
+			std::memcpy(out, table, bytes);
+		}
+	};
+	std::array<uint32_t, 256> attrib_words {};
+	uint32_t                  attrib_count = 0;
+	for (const auto& in: input_semantics) {
+		attrib_count = std::max(attrib_count, static_cast<uint32_t>(in.semantic) + 1u);
+	}
+	read_table(attrib, attrib_words.data(), attrib_count);
+	uint32_t buffer_count = 0;
+	for (const auto& in: input_semantics) {
+		buffer_count = std::max(buffer_count, ((attrib_words[in.semantic] & 0x1fu) + 1u) * 4u);
+	}
+	std::array<uint32_t, 32 * 4> buffer_words {};
+	read_table(buffer, buffer_words.data(), buffer_count);
+	attrib = attrib_words.data();
+	buffer = buffer_words.data();
 
 	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const auto& in = input_semantics[i];

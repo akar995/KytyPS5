@@ -464,6 +464,10 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	ShaderRecompiler::SetHardwareStorageBufferBounds(graphics.robust_buffer_access2_enabled);
+	ShaderRecompiler::SetSharedMemoryLimits(
+	    graphics.physical_device_properties.limits.maxComputeSharedMemorySize,
+	    graphics.mesh_shader_enabled ? graphics.mesh_shader_properties.maxMeshSharedMemorySize : 0u);
 	InitializeDriverCache();
 	WarmUp(shader_store);
 }

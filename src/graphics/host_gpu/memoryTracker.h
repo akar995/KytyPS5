@@ -25,10 +25,60 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// End of the range from vaddr, within its tracking region, that has no GPU-modified page and
+	// so reads without faulting; vaddr when its own page is GPU-modified.
+	[[nodiscard]] uint64_t GpuCleanEnd(uint64_t vaddr) {
+		const auto index      = vaddr / TRACKER_REGION_SIZE;
+		const auto region_end = (index + 1) * TRACKER_REGION_SIZE;
+		if (!GuestRange {vaddr, 1}.Valid() || region_end > TRACKER_ADDRESS_SIZE) {
+			return vaddr;
+		}
+		auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr || !manager->MayHaveGpuModified()) {
+			return region_end;
+		}
+		std::scoped_lock lock(manager->lock);
+		return manager->GpuCleanEnd(vaddr);
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Advances whenever a range can have become CPU-dirty, so callers can tell whether a full
+	// upload pass may find anything new.
+	[[nodiscard]] uint64_t CpuDirtyGeneration() const noexcept {
+		return m_cpu_dirty_generation.load(std::memory_order_acquire);
+	}
+	void BumpCpuDirtyGeneration() noexcept {
+		m_cpu_dirty_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+	// Records a range whose pages can have become CPU-dirty, then advances the generation. Called
+	// after the pages change state, so a caller that reads the generation and then takes the
+	// ranges sees every page that generation covers.
+	void NoteCpuDirty(uint64_t vaddr, uint64_t size) noexcept {
+		{
+			std::scoped_lock lock(m_noted_lock);
+			const auto end = vaddr + size;
+			if (!m_noted.empty() && vaddr <= m_noted.back().second &&
+			    end >= m_noted.back().first) {
+				m_noted.back().first  = std::min(m_noted.back().first, vaddr);
+				m_noted.back().second = std::max(m_noted.back().second, end);
+			} else if (m_noted.size() < MAX_NOTED_RANGES) {
+				m_noted.emplace_back(vaddr, end);
+			} else {
+				m_noted_overflow = true;
+			}
+		}
+		BumpCpuDirtyGeneration();
+	}
+	// Moves out the [begin, end) ranges noted since the last call. Returns false when more were
+	// noted than could be listed; the caller then has to treat all memory as possibly dirty.
+	bool TakeCpuDirtyRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) noexcept {
+		ranges.clear();
+		std::scoped_lock lock(m_noted_lock);
+		ranges.swap(m_noted);
+		return !std::exchange(m_noted_overflow, false);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -51,6 +101,33 @@ public:
 				on_flush();
 			}
 		});
+		NoteCpuDirty(vaddr, size);
+	}
+	// InvalidateRegion for a CPU write fault on vaddr's page. Guest code that writes one page of
+	// a buffer usually writes its neighbours next, often from several threads at once, and each
+	// fault is a host exception that the OS dispatches under a process-wide lock. Unless the page
+	// needs a flush, the clean pages of its aligned block are unprotected with it; any of them
+	// the CPU does not write only costs a redundant upload.
+	template <typename Flush>
+	void InvalidateWriteFault(uint64_t vaddr, Flush&& on_flush) noexcept {
+		static_assert(std::is_invocable_v<Flush&>);
+		CheckNotInUploadCallback();
+
+		Iterate<false>(vaddr, 1, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const bool should_flush = [&] {
+				std::scoped_lock lock(manager->lock);
+				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+					return true;
+				}
+				manager->ChangeCpuStateForFault(manager->GetCpuAddr() + offset);
+				return false;
+			}();
+			if (should_flush) {
+				on_flush();
+			}
+		});
+		constexpr uint64_t block_size = TRACKER_FAULT_BLOCK_PAGES * TRACKER_PAGE_SIZE;
+		NoteCpuDirty(vaddr & ~(block_size - 1), block_size);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -106,6 +183,13 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	std::atomic<uint64_t> m_cpu_dirty_generation = 0;
+	// Ranges noted since the last TakeCpuDirtyRanges; past MAX_NOTED_RANGES only the overflow
+	// flag is kept.
+	static constexpr size_t                     MAX_NOTED_RANGES = 4096;
+	TrackingSpinLock                            m_noted_lock;
+	std::vector<std::pair<uint64_t, uint64_t>> m_noted;
+	bool                                        m_noted_overflow = false;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

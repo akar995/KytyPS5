@@ -15,9 +15,28 @@ SamplerCache::~SamplerCache() {
 }
 
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
-	Common::LockGuard lock(m_mutex);
-
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+	// Samplers live as long as the cache and draws reuse a handful, so each thread remembers
+	// the recent ones and skips the lock.
+	struct Recent {
+		uint64_t    owner = 0;
+		SamplerKey  key {};
+		vk::Sampler sampler = nullptr;
+	};
+	thread_local std::array<Recent, 16> recent;
+	auto& slot = recent[SamplerKeyHash {}(key) % recent.size()];
+	if (slot.owner == m_id && slot.key == key) {
+		return slot.sampler;
+	}
+	const auto sampler = FindOrCreate(r, key);
+	slot               = {m_id, key, sampler};
+	return sampler;
+}
+
+vk::Sampler SamplerCache::FindOrCreate(const ShaderSamplerResource& r, const SamplerKey& key) {
+	Common::LockGuard lock(m_mutex);
+	const bool        integer_border = key[4] != 0;
+
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}

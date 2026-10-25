@@ -195,6 +195,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.endRendering();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
 	m_scheduler.GetDynamicState().Invalidate();
+	// This pipeline declares other dynamic states, so draws must record theirs again.
+	command_buffer.InvalidateGraphicsState();
 }
 
 } // namespace Libs::Graphics

@@ -93,6 +93,8 @@ struct ConfigOptions {
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
+	bool                   async_pipelines_enabled     = true;
+	bool                   record_thread_enabled       = true;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -160,6 +162,10 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
+bool AsyncPipelinesEnabled();
+// The render scheduler's submit thread records the GPU thread's Vulkan commands, which the GPU
+// thread only queues (KYTY_RECORD_THREAD=0 or 1 overrides it). Read at start.
+bool RecordThreadEnabled();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

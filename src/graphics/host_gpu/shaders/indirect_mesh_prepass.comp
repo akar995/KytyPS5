@@ -1,0 +1,80 @@
+#version 450
+
+// Turns a GPU-written guest indirect draw record into a mesh-task launch and the draw
+// parameters the mesh shader reads, so the CPU never has to wait for the record.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// The guest's DRAW_INDIRECT or DRAW_INDEX_INDIRECT record.
+layout(std430, binding = 0) readonly buffer args_buf {
+    uint args[];
+};
+
+// Mesh draw parameters in dwords 0-5, VkDrawMeshTasksIndirectCommandEXT in dwords 8-10.
+layout(std430, binding = 1) writeonly buffer record_buf {
+    uint record[];
+};
+
+layout(push_constant) uniform Params {
+    uint args_offset;
+    uint indexed;
+    uint element_size;
+    uint index_base_lo;
+    uint index_base_hi;
+    uint index_buffer_size;
+    uint primitive_size;
+    uint primitive_step;
+    uint primitives_per_group;
+    uint max_groups_x;
+    uint max_groups_y;
+    uint max_groups_total;
+} p;
+
+void main() {
+    const uint a        = p.args_offset;
+    uint count          = args[a + 0u];
+    uint instances      = args[a + 1u];
+    uint vertex_param   = 0u;
+    uint first_instance = 0u;
+    uint index_lo       = 0u;
+    uint index_hi       = 0u;
+    if (p.indexed != 0u) {
+        const uint start_index = args[a + 2u];
+        vertex_param           = args[a + 3u];
+        first_instance         = args[a + 4u];
+        if (p.index_buffer_size != 0u) {
+            count = min(count, p.index_buffer_size);
+        }
+        uint offset_hi = 0u;
+        uint offset_lo = 0u;
+        umulExtended(start_index, p.element_size, offset_hi, offset_lo);
+        uint carry = 0u;
+        index_lo   = uaddCarry(p.index_base_lo, offset_lo, carry);
+        index_hi   = p.index_base_hi + offset_hi + carry;
+    } else {
+        vertex_param   = args[a + 2u];
+        first_instance = args[a + 3u];
+    }
+
+    const uint primitives =
+        count < p.primitive_size ? 0u : (count - p.primitive_size) / p.primitive_step + 1u;
+    uint groups = primitives == 0u ? 0u : (primitives - 1u) / p.primitives_per_group + 1u;
+    uint total_hi = 0u;
+    uint total_lo = 0u;
+    umulExtended(groups, instances, total_hi, total_lo);
+    // Launches the host cannot express are dropped; the CPU path stops the emulator instead.
+    if (instances == 0u || groups > p.max_groups_x || instances > p.max_groups_y ||
+        total_hi != 0u || total_lo > p.max_groups_total) {
+        groups = 0u;
+    }
+
+    record[0]  = count;
+    record[1]  = vertex_param;
+    record[2]  = first_instance;
+    record[3]  = p.element_size;
+    record[4]  = index_lo;
+    record[5]  = index_hi;
+    record[8]  = groups;
+    record[9]  = groups == 0u ? 0u : instances;
+    record[10] = groups == 0u ? 0u : 1u;
+}

@@ -61,6 +61,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputLayer         = VK_TRUE;
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
+	features.hostQueryReset = VK_TRUE; // PERF-INSTR
 	features.shaderBufferInt64Atomics  = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
@@ -607,7 +608,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled =
-	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
+	    conditional_rendering_extension && conditional_rendering.conditionalRendering &&
+	    std::getenv("KYTY_NO_COND_RENDER") == nullptr; // PERF-INSTR
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -654,6 +656,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
 		    vk::SampleCountFlagBits::e1;
 	}
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
+	graphics.draw_indirect_first_instance_enabled = device_features.drawIndirectFirstInstance;
 	graphics.sample_rate_shading_enabled                 = true;
 	// Occlusion queries reset their queries from the host and count samples exactly where they can.
 	graphics.occlusion_queries_enabled =
@@ -688,6 +692,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		robustness2.pNext = &features12;
 	}
 #endif
+	graphics.robust_buffer_access2_enabled =
+	    supported_robustness2.robustBufferAccess2 != VK_FALSE;
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;

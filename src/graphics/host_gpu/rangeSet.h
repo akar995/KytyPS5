@@ -12,6 +12,10 @@ namespace Libs::Graphics {
 class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
+		// Nodes never touch, so a range inside one changes nothing; skip the erase and re-insert.
+		if (Contains(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -63,6 +67,23 @@ public:
 			return true;
 		}
 		return it != m_ranges.end() && it->first < end;
+	}
+
+	// The whole range that contains [address, address + size), if any.
+	[[nodiscard]] bool FindContaining(uint64_t address, uint64_t size, uint64_t& begin,
+	                                  uint64_t& last) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return false;
+		}
+		--it;
+		if (it->first > address || it->second < end) {
+			return false;
+		}
+		begin = it->first;
+		last  = it->second;
+		return true;
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {

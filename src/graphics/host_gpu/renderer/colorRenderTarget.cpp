@@ -1,3 +1,4 @@
+#include "common/perfCounters.h" // PERF-INSTR
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
@@ -18,6 +19,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -69,6 +72,22 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			}
 		}
 
+		return;
+	}
+	using Registers = std::remove_cvref_t<decltype(rt)>;
+	static_assert(std::is_trivially_copyable_v<Registers> &&
+	              sizeof(Registers) <= sizeof(ColorTargetMemo::registers));
+	auto& texture_cache = m_context.GetTextureCache();
+	auto& memo          = m_color_target_memos.at(rt_slot);
+	if (memo.valid && memo.slot_mask == mask && memo.slice_offset == render_target_slice_offset &&
+	    memo.ignore_target_mask == ignore_target_mask && memo.exact_format == exact_format &&
+	    std::memcmp(memo.registers.data(), &rt, sizeof(Registers)) == 0 &&
+	    texture_cache.ImageSetUnchanged(memo.epoch, memo.result.desc.info.data) &&
+	    !graphics_debug_dump_enabled()) {
+		r          = memo.result;
+		memo.epoch = texture_cache.ImageSetEpoch();
+		(void)texture_cache.RefindImage(r.image_id, r.desc);
+		BindRenderTarget(r.image_id);
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
@@ -262,12 +281,22 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	bool direct                = false;
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format, &direct);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	memo.valid = direct;
+	if (direct) {
+		std::memcpy(memo.registers.data(), &rt, sizeof(Registers));
+		memo.slot_mask          = mask;
+		memo.slice_offset       = render_target_slice_offset;
+		memo.ignore_target_mask = ignore_target_mask;
+		memo.exact_format       = exact_format;
+		memo.epoch              = texture_cache.ImageSetEpoch();
+		memo.result             = r;
+	}
 }
 
 } // namespace Libs::Graphics

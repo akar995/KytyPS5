@@ -19,6 +19,9 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	// Advances whenever a page becomes read-protected, so work that read guest memory earlier
+	// can tell whether GPU-written data may have replaced what it read.
+	[[nodiscard]] static uint64_t ReadProtectGeneration() noexcept;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

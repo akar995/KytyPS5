@@ -1690,6 +1690,7 @@ void VideoOutDriver::SubmitFlipPreparation(uint64_t request_id) {
 }
 
 void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+	buffer.GetContext().GetTextureCache().TickFrame();
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 }
 

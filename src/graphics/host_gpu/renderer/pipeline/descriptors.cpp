@@ -1,3 +1,4 @@
+#include "common/perfCounters.h" // PERF-INSTR
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -463,22 +464,9 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-
+static void ComputeTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, bool storage,
+                               ResolvedTextureDesc&         out) {
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -585,10 +573,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
-	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -604,8 +588,70 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	out.desc              = std::move(desc);
+	out.pixel_format      = pixel_format;
+	out.view_format       = view_format;
+	out.size              = out.desc.info.data.size;
+	out.shader_conversion = shader_conversion;
+}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+
+	TextureDescKey key {};
+	std::memcpy(key.dwords.data(), descriptor.fields, sizeof(key.dwords));
+	key.attributes = {static_cast<uint32_t>(resource.resource_class),
+	                  static_cast<uint32_t>(resource.numeric_class),
+	                  static_cast<uint32_t>(resource.dimension),
+	                  static_cast<uint32_t>(resource.mip_mode),
+	                  resource.mip_count,
+	                  static_cast<uint32_t>(resource.conversion_format),
+	                  resource.shader_swizzle,
+	                  (resource.read ? 1u : 0u) | (resource.written ? 2u : 0u) |
+	                      (resource.atomic ? 4u : 0u) | (resource.atomic64 ? 8u : 0u) |
+	                      (resource.depth_compare ? 16u : 0u) | (resource.cube ? 32u : 0u) |
+	                      (resource.r128 ? 64u : 0u)};
+	auto cached = m_texture_descs.find(key);
+	if (cached == m_texture_descs.end()) {
+		if (m_texture_descs.size() >= 16384) {
+			m_texture_descs.clear();
+		}
+		ResolvedTextureDesc resolved;
+		ComputeTextureDesc(resource, descriptor, storage, resolved);
+		cached = m_texture_descs.emplace(key, std::move(resolved)).first;
+	}
+	auto& resolved = cached->second;
+	auto  desc     = resolved.desc;
+	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+	if (resource.heap && !m_context.IsMapped(desc.info.data.address, desc.info.data.size)) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+
+	ImageId id;
+	ImageId refind_id;
+	if (resolved.image && texture_cache.ImageSetUnchanged(resolved.image_epoch, desc.info.data)) {
+		id                   = texture_cache.RefindImage(resolved.image, desc);
+		refind_id            = id;
+		resolved.image_epoch = texture_cache.ImageSetEpoch();
+	} else {
+		bool direct          = false;
+		id                   = texture_cache.FindImage(desc, resolved.shader_conversion, &direct);
+		resolved.image       = direct ? id : ImageId {};
+		resolved.image_epoch = texture_cache.ImageSetEpoch();
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -615,15 +661,44 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
-		                            desc.info.data.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, resolved.pixel_format,
+		                            resolved.size);
 	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		ValidateStorageColorView(image->info.pixel_format, resolved.view_format,
+		                         descriptor.DstSelXYZW());
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		(void)SelectSampledColorView(image->info.pixel_format, resolved.pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	TextureBinding binding {id, nullptr, std::move(desc)};
+	if (refind_id) {
+		binding.resolved_resource = &resource;
+		binding.resolved_value    = value;
+		binding.resolved_epoch    = texture_cache.ImageSetEpoch();
+		binding.refind_id         = refind_id;
+	}
+	return binding;
+}
+
+bool RenderExecutor::KeepTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                 const ShaderRecompiler::IR::DescriptorValue& value,
+                                 TextureBinding&                              binding) {
+	auto& texture_cache = m_context.GetTextureCache();
+	if (binding.resolved_resource != &resource || binding.resolved_epoch == 0 ||
+	    binding.resolved_epoch != texture_cache.ImageSetEpoch() || !(binding.resolved_value == value)) {
+		return false;
+	}
+	// With the same descriptor and image set, ResolveTexture would refind the same image.
+	const auto* image = texture_cache.m_slot_images.try_get(binding.refind_id);
+	if (image == nullptr ||
+	    (image->depth_id ? image->depth_id : binding.refind_id) != binding.image_id) {
+		return false;
+	}
+	(void)texture_cache.RefindImage(binding.refind_id, binding.desc);
+	// The view stays: RebindImages reuses it while the image is unchanged.
+	binding.layout = vk::ImageLayout::eUndefined;
+	binding.mip_views.clear();
+	return true;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -694,6 +769,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (program.info.images[i].heap) {
 			prepared.images[i] = {};
+			continue;
+		}
+		if (KeepTexture(program.info.images[i], snapshot.images[i], prepared.images[i])) {
+			BindImage(prepared.images[i].image_id,
+			          prepared.images[i].desc.type == TextureCache::BindingType::Storage);
 			continue;
 		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -844,7 +924,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
-		} else {
+		} else if (binding.image_view == nullptr ||
+		           !texture_cache.RefindTexture(binding.image_id, binding.desc.type)) {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);

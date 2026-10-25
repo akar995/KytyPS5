@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h" // PERF-INSTR
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -105,6 +106,35 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 	}
 }
 
+// Nothing writes an image in these layouts, whatever attachment access the uses name.
+bool IsReadOnlyLayout(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eShaderReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal:
+		case vk::ImageLayout::eReadOnlyOptimal: return true;
+		default: return false;
+	}
+}
+
+// Within one read-only layout no write can follow the barrier that entered it, so a use whose
+// accesses and stages an earlier barrier already made visible needs none. Otherwise the barrier
+// adds the new use and the state keeps every reader, for the barrier that leaves the layout.
+bool CoveredReadOnlyUse(const VulkanImageState& state, vk::ImageLayout layout,
+                        vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	return state.layout == layout && IsReadOnlyLayout(layout) && !(access & ~state.access_mask) &&
+	       !(stage & ~state.pl_stage);
+}
+
+VulkanImageState NextImageState(const VulkanImageState& state, vk::ImageLayout layout,
+                                vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	if (state.layout == layout && IsReadOnlyLayout(layout)) {
+		return {state.pl_stage | stage, state.access_mask | access, layout};
+	}
+	return {stage, access, layout};
+}
+
 } // namespace
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
@@ -185,6 +215,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
+		if (CoveredReadOnlyUse(state, destination_layout, destination_access, destination_stage)) {
+			return {};
+		}
 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
 		                                vk::AccessFlagBits2::eShaderWrite |
 		                                vk::AccessFlagBits2::eMemoryWrite;
@@ -210,6 +243,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barrier.subresourceRange.baseArrayLayer = 0;
 		barrier.subresourceRange.layerCount     = VK_REMAINING_ARRAY_LAYERS;
 		barriers.push_back(barrier);
+		state = NextImageState(state, destination_layout, destination_access, destination_stage);
+		return barriers;
 	}
 
 	// Resident heaps sample their images in the read state; only leaving it invalidates them.
@@ -242,6 +277,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		return;
 	}
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
@@ -252,6 +288,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
 	buffer_barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
@@ -291,6 +328,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
 	buffer_barrier.srcAccessMask =
@@ -350,6 +388,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	const uint32_t base_depth = source.backing.image_type == backing.image_type
 	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
@@ -436,6 +475,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
 
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	auto command = m_scheduler.Current().Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               resolved_source_range, command);
@@ -474,6 +514,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto     source_aspect =
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
@@ -578,6 +619,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
+	GpuProfNote(GpuProfTransit); // PERF-INSTR
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
@@ -707,6 +749,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	ImageOps::Validate(info);
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
+	// Such an image is fully uploaded from guest memory before any use, so it may take over
+	// another image's memory without its old contents showing.
+	m_reusable_backing = m_cpu_dirty && info.samples == 1;
 	if (info.pixel_format == vk::Format::eUndefined) {
 		return;
 	}
@@ -735,7 +780,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	if (!graphics.CreateImage(create, backing, m_reusable_backing)) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
@@ -775,7 +820,7 @@ Image::~Image() {
 		}
 	}
 	if (backing.image != nullptr) {
-		m_graphics.DeleteImage(backing);
+		m_graphics.DeleteImage(backing, m_reusable_backing);
 	}
 }
 

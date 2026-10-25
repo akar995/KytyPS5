@@ -1,3 +1,5 @@
+#include <cstdio> // PERF-INSTR
+#include <cstdlib> // PERF-INSTR
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -39,6 +41,18 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// PERF-INSTR: a debug label naming the shaders, for GPU crash analysis (KYTY_RGD_LABELS).
+static void RgdLabel(vk::CommandBuffer command, const char* kind, uint64_t a, uint64_t b) {
+	static const bool enabled = std::getenv("KYTY_RGD_LABELS") != nullptr;
+	if (!enabled) return;
+	char text[96];
+	std::snprintf(text, sizeof(text), "%s %016llx %016llx", kind, static_cast<unsigned long long>(a),
+	              static_cast<unsigned long long>(b));
+	vk::DebugUtilsLabelEXT label {};
+	label.pLabelName = text;
+	command.insertDebugUtilsLabelEXT(&label);
+}
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -465,6 +479,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 	} else {
+		RgdLabel(vk_buffer, "CS", program.shader_hash, 0u); // PERF-INSTR
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
@@ -539,6 +554,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	RgdLabel(vk_buffer, "CS", program.shader_hash, 1u); // PERF-INSTR
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

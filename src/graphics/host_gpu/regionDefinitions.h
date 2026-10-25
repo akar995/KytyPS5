@@ -14,6 +14,9 @@ constexpr uint64_t TRACKER_REGION_SIZE  = 4ull * 1024ull * 1024ull;
 constexpr uint64_t TRACKER_ADDRESS_SIZE = 1ull << 44u;
 constexpr uint64_t LOWER_ADDRESS_SIZE   = 1ull << 40u;
 constexpr size_t   TRACKER_REGION_PAGES = TRACKER_REGION_SIZE / TRACKER_PAGE_SIZE;
+// Pages a CPU write fault unprotects together; see MemoryTracker::InvalidateWriteFault.
+constexpr size_t TRACKER_FAULT_BLOCK_PAGES = 16;
+static_assert(TRACKER_REGION_PAGES % TRACKER_FAULT_BLOCK_PAGES == 0);
 
 struct GuestRange {
 	uint64_t address = 0;

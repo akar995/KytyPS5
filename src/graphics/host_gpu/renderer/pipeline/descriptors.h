@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -24,6 +25,46 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// Set when a resolution found image_id through refind_id with the image set at
+	// resolved_epoch, so the same resource and descriptor can keep this binding until the image
+	// set changes.
+	const ShaderRecompiler::IR::ImageResource* resolved_resource = nullptr;
+	ShaderRecompiler::IR::DescriptorValue      resolved_value;
+	uint64_t                                   resolved_epoch = 0;
+	ImageId                                    refind_id;
+};
+
+// A texture descriptor's words plus the static attributes of the shader resource using it.
+struct TextureDescKey {
+	std::array<uint32_t, 8> dwords {};
+	std::array<uint32_t, 8> attributes {};
+
+	bool operator==(const TextureDescKey& other) const = default;
+};
+
+struct TextureDescKeyHash {
+	size_t operator()(const TextureDescKey& key) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const auto word: key.dwords) {
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+		for (const auto word: key.attributes) {
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+		return static_cast<size_t>(hash ^ (hash >> 32u));
+	}
+};
+
+struct ResolvedTextureDesc {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+	bool                    shader_conversion = false;
+	// The image FindImage matched directly for desc, still valid while no image overlapping
+	// desc's data has been registered or unregistered since image_epoch.
+	ImageId                 image;
+	uint64_t                image_epoch = 0;
 };
 
 struct PreparedBindings {

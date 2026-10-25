@@ -35,6 +35,16 @@ public:
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
 
+	// Gives the calling thread a physical core of its own when the host has cores to spare:
+	// the process's other threads stop running on that core's logical processors, so an
+	// SMT sibling or a guest thread never slows it down. For the few host threads that pace a
+	// frame on their own; each `slot` gets a different core.
+	static void DedicateCore(uint32_t slot);
+	// Default number of draw lookahead workers (KYTY_LOOKAHEAD_WORKERS overrides it); each
+	// takes a dedicated core after the GPU thread. None until the lookahead is ported to the
+	// folded pipeline cache.
+	static constexpr uint32_t LookaheadWorkerCount = 0;
+
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
 	static std::string GetThreadId();

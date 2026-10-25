@@ -9,7 +9,9 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <unordered_map>
 
 namespace Libs::Graphics {
@@ -18,7 +20,7 @@ struct GraphicContext;
 
 class SamplerCache {
 public:
-	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics) {
+	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics), m_id(NextId()) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
 	~SamplerCache();
@@ -28,6 +30,13 @@ public:
 
 private:
 	using SamplerKey = std::array<uint32_t, 5>;
+
+	vk::Sampler FindOrCreate(const ShaderSamplerResource& r, const SamplerKey& key);
+
+	static uint64_t NextId() {
+		static std::atomic<uint64_t> next {1};
+		return next.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {
@@ -42,6 +51,8 @@ private:
 	};
 
 	GraphicContext&                                             m_graphics;
+	// Tells this cache's samplers apart in the per-thread memo of GetSampler.
+	const uint64_t                                              m_id;
 	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };

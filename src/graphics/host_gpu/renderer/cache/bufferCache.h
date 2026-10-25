@@ -13,8 +13,10 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -53,6 +55,8 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// InvalidateMemory for a CPU write fault on vaddr; may also unprotect clean nearby pages.
+	void                   InvalidateWriteFault(uint64_t vaddr);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -90,10 +94,23 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	[[nodiscard]] uint64_t GpuCleanEnd(uint64_t vaddr) { return m_memory_tracker.GpuCleanEnd(vaddr); }
+	// Changes whenever buffer contents may need an upload: CPU-dirty ranges or new buffers.
+	[[nodiscard]] uint64_t UploadGeneration() const noexcept {
+		return m_memory_tracker.CpuDirtyGeneration();
+	}
+	// Uploads every buffer range that can hold CPU-dirty pages, within the given ranges.
+	void SynchronizeDirtyBuffers(const RangeSet& within);
 	void               RunGarbageCollector();
+	// Runs on the recording thread before a submission. Pages the CPU reads back get their GPU
+	// writes downloaded at the end of the submission that makes them, so a later CPU access waits
+	// for that submission only, not for everything queued since. Pages whose downloads have
+	// published are released for direct CPU access.
+	void               BeforeSubmit();
 
 private:
 	friend struct BufferCacheTestAccess;
+	class CopyWorkers;
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 
@@ -120,6 +137,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
+	// Adds the ranges the memory tracker noted since the last call to m_maybe_cpu_dirty.
+	void DrainCpuDirtyRanges();
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -127,6 +146,11 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	void               NoteCpuReadBack(uint64_t vaddr, uint64_t size);
+	void               NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasQueuedDownload(uint64_t vaddr, uint64_t size) const;
+	// Waits for the queued downloads of these pages, if any, once nothing newer is GPU-dirty.
+	[[nodiscard]] bool WaitQueuedDownloads(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -147,11 +171,28 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	std::unique_ptr<CopyWorkers>                      m_copy_workers;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Tracker pages (address / TRACKER_PAGE_SIZE) the CPU has read back, with the tick of the
+	// latest read, and those of them written since the last submission.
+	std::unordered_map<uint64_t, uint64_t> m_read_back_pages;
+	std::vector<uint64_t>                  m_written_read_back_pages;
+	// Read-back pages with a queued download, and the tick whose completion publishes it, and the
+	// bytes those downloads carry.
+	std::unordered_map<uint64_t, uint64_t> m_queued_downloads;
+	RangeSet                               m_queued_download_ranges;
+	// A superset of the buffer pages that hold CPU-dirty data, so that synchronizing a clean
+	// range takes no tracker lock. Ranges leave it once uploaded.
+	RangeSet                                   m_maybe_cpu_dirty;
+	uint64_t                                   m_drained_generation = UINT64_MAX;
+	std::vector<std::pair<uint64_t, uint64_t>> m_noted_ranges;
+	// Ranges drained while SynchronizeDirtyBuffers sweeps, which its cleanup must keep.
+	bool                                       m_sweeping = false;
+	std::vector<std::pair<uint64_t, uint64_t>> m_swept_notes;
 };
 
 } // namespace Libs::Graphics

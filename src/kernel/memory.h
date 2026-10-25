@@ -140,6 +140,24 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+[[nodiscard]] bool IsGpuMapped(uint64_t vaddr, uint64_t size) noexcept;
+[[nodiscard]] bool FindGpuMappedRange(uint64_t vaddr, uint64_t size, uint64_t& begin,
+                                      uint64_t& end) noexcept;
+// End of the range from vaddr that holds no GPU-written page, so plain loads there neither
+// fault nor wait for the GPU; vaddr when its page holds GPU-written data or off the GPU thread.
+[[nodiscard]] uint64_t GpuReadableEnd(uint64_t vaddr) noexcept;
+// Marks the calling thread as a GPU resource helper: it evaluates shader resources while the
+// GPU thread records no work, so GPU-written state holds still. GpuReadableEnd answers there as
+// on the GPU thread, and TryReadBufferBacking reads pages without GPU-written data; a read that
+// needs the GPU thread fails and blocks the evaluation, which the GPU thread then repeats.
+void               SetGpuResourceHelper(bool helper) noexcept;
+[[nodiscard]] bool GpuResourceHelperBlocked() noexcept;
+// Whether this thread is a resource helper: it must not touch guest pages directly.
+[[nodiscard]] bool IsGpuResourceHelper() noexcept;
+// Returns whether the helper's evaluation since the last call was blocked, and clears it.
+[[nodiscard]] bool TakeGpuResourceHelperBlocked() noexcept;
+// Blocks the helper's current evaluation, from a reader that cannot serve it off the GPU thread.
+void               BlockGpuResourceHelper() noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

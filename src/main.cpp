@@ -433,7 +433,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if defined(KYTY_PGO_GEN) // PERF-INSTR
+#include <chrono> // PERF-INSTR
+#include <thread> // PERF-INSTR
+extern "C" int __llvm_profile_write_file(void); // PERF-INSTR
+static void StartPgoDump() { // PERF-INSTR
+	const char* seconds = std::getenv("KYTY_PGO_DUMP_SECONDS"); // PERF-INSTR
+	if (seconds == nullptr) return; // PERF-INSTR
+	std::thread([s = std::atoi(seconds)] { // PERF-INSTR
+		std::this_thread::sleep_for(std::chrono::seconds(s)); // PERF-INSTR
+		__llvm_profile_write_file(); // PERF-INSTR
+		std::fprintf(stderr, "PGO profile written\n"); // PERF-INSTR
+	}).detach(); // PERF-INSTR
+} // PERF-INSTR
+#else // PERF-INSTR
+static void StartPgoDump() {} // PERF-INSTR
+#endif // PERF-INSTR
 static int Main(int argc, char* argv[]) {
+	StartPgoDump(); // PERF-INSTR
 	VirtualMemory::Init();
 	InitializeThreads();
 

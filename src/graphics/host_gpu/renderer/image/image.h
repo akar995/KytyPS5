@@ -158,9 +158,19 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	uint64_t         frame_accessed_last = 0;
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
+	// The GC tick of the last LRU touch: touches within one GC tick change nothing.
+	uint64_t         gc_tick_touched    = UINT64_MAX;
+	// The color metadata generation and slices of the last clear materialization check, and the
+	// count of surface clear-flag entries added before it (TextureCache::m_surface_meta_inserts).
+	uint64_t clear_check_generation      = UINT64_MAX;
+	uint64_t clear_check_address         = 0;
+	uint32_t clear_check_first           = 0;
+	uint32_t clear_check_count           = 0;
+	uint64_t clear_check_surface_inserts = UINT64_MAX;
 
 private:
 	friend struct ImageTestAccess;
@@ -173,11 +183,13 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash  = 0;
-	bool              m_cpu_dirty       = false;
-	bool              m_maybe_cpu_dirty = false;
-	bool              m_gpu_modified    = false;
-	bool              m_buffer_modified = false;
+	uint64_t          m_maybe_cpu_hash   = 0;
+	bool              m_cpu_dirty        = false;
+	bool              m_reusable_backing = false;
+	bool              m_maybe_cpu_dirty  = false;
+	bool              m_maybe_hash_valid = false;
+	bool              m_gpu_modified     = false;
+	bool              m_buffer_modified  = false;
 };
 
 namespace ImageOps {

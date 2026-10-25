@@ -4,14 +4,19 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <cstring>
 #include <optional>
 #include <span>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -99,6 +104,78 @@ struct SubmitInfo {
 	}
 };
 
+// The graphics state last recorded into a command buffer. Every draw pipeline declares the same
+// dynamic states, so dynamic state and vertex/index bindings persist across draws, pipeline binds
+// and render passes; a draw records only what differs. Values are compared bit for bit.
+struct GraphicsStateCache {
+	static constexpr uint32_t MaxViewports     = 16;
+	static constexpr uint32_t MaxVertexBuffers = 32;
+
+	struct Viewports {
+		uint32_t                               count = 0;
+		std::array<vk::Viewport, MaxViewports> viewports {};
+		std::array<vk::Rect2D, MaxViewports>   scissors {};
+	};
+	struct Depth {
+		vk::Bool32    test_enable  = VK_FALSE;
+		vk::Bool32    write_enable = VK_FALSE;
+		vk::CompareOp compare_op   = vk::CompareOp::eNever;
+		vk::Bool32    bounds_test  = VK_FALSE;
+		float         bounds_min   = 0.0f;
+		float         bounds_max   = 0.0f;
+	};
+	struct DepthBias {
+		vk::Bool32 enable   = VK_FALSE;
+		float      constant = 0.0f;
+		float      clamp    = 0.0f;
+		float      slope    = 0.0f;
+	};
+	struct Stencil {
+		vk::Bool32         enable = VK_FALSE;
+		vk::StencilOpState front;
+		vk::StencilOpState back;
+	};
+	struct ColorWrite {
+		uint32_t                                                count = 0;
+		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> enable {};
+	};
+	struct VertexBuffers {
+		uint32_t                                   count = 0;
+		std::array<vk::Buffer, MaxVertexBuffers>     buffers {};
+		std::array<vk::DeviceSize, MaxVertexBuffers> offsets {};
+		std::array<vk::DeviceSize, MaxVertexBuffers> sizes {};
+	};
+	struct IndexBuffer {
+		vk::Buffer     buffer = nullptr;
+		vk::DeviceSize offset = 0;
+		vk::IndexType  type   = vk::IndexType::eUint16;
+	};
+
+	// Returns whether `value` differs from the cached one (or the cache is unset), and stores it.
+	template <typename T>
+	static bool Update(std::optional<T>& cached, const T& value) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		if (cached && std::memcmp(&*cached, &value, sizeof(T)) == 0) {
+			return false;
+		}
+		cached = value;
+		return true;
+	}
+
+	std::optional<vk::Pipeline>         pipeline;
+	std::optional<Viewports>            viewports;
+	std::optional<float>                line_width;
+	std::optional<std::array<float, 4>> blend_constants;
+	std::optional<Depth>                depth;
+	std::optional<DepthBias>            depth_bias;
+	std::optional<Stencil>              stencil;
+	std::optional<ColorWrite>           color_write;
+	std::optional<vk::ImageAspectFlags> feedback_loop;
+	std::optional<VertexBuffers>        vertex_buffers;
+	std::optional<IndexBuffer>          index_buffer;
+};
+
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -106,13 +183,34 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
+	void ClearInsidePass(const RenderState& state) const;
+	// Ends the rendering instance, then records the barrier of any deferred shader writes.
 	void EndRendering() const;
+	// A draw whose shaders wrote buffers leaves the barrier that makes the writes visible pending
+	// while rendering continues. Every command other than a draw ends rendering before it records,
+	// which records the barrier; a later draw that may read the writes ends rendering first.
+	void DeferShaderWriteBarrier(vk::PipelineStageFlags source_stages) const {
+		m_pending_shader_writes |= source_stages;
+	}
+	[[nodiscard]] bool HasPendingShaderWrites() const noexcept {
+		return static_cast<bool>(m_pending_shader_writes);
+	}
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Every command is recorded through a Handle() call, so an unchanged count since the last
+	// global barrier means nothing was recorded after it and another would order nothing new.
+	[[nodiscard]] bool FollowsGlobalBarrier() const noexcept {
+		return m_barrier_handle_uses == m_handle_uses;
+	}
+	void MarkGlobalBarrier() const noexcept { m_barrier_handle_uses = m_handle_uses; }
+	[[nodiscard]] GraphicsStateCache& StateCache() const noexcept { return m_state_cache; }
+	// For recording paths that bind their own graphics pipeline or set state outside the cache.
+	void InvalidateGraphicsState() const noexcept { m_state_cache = {}; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -141,7 +239,11 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
+	mutable GraphicsStateCache m_state_cache;
 	mutable bool        m_rendering   = false;
+	mutable uint64_t    m_handle_uses = 0;
+	mutable uint64_t    m_barrier_handle_uses = UINT64_MAX;
+	mutable vk::PipelineStageFlags m_pending_shader_writes;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -179,6 +281,11 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// Keeps a binding ResolveTexture made for the same resource and descriptor while the image
+	// set is unchanged, doing only the per-use work of a resolution; false if it must resolve.
+	[[nodiscard]] bool KeepTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                               const ShaderRecompiler::IR::DescriptorValue& value,
+	                               TextureBinding&                              binding);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -218,6 +325,35 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	struct WrittenRange {
+		GuestRange range;
+		bool       image = false;
+	};
+	std::vector<WrittenRange>             m_written_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_read_runs;
+	// Texture descriptions computed from descriptor words and static resource attributes.
+	std::unordered_map<TextureDescKey, ResolvedTextureDesc, TextureDescKeyHash> m_texture_descs;
+	// The last color target resolved per slot. It holds while the slot's registers and the call's
+	// arguments repeat and no image overlapping the target is registered or unregistered.
+	struct ColorTargetMemo {
+		std::array<uint32_t, 64>         registers {};
+		uint32_t                         slot_mask          = 0;
+		uint32_t                         slice_offset       = 0;
+		bool                             ignore_target_mask = false;
+		bool                             exact_format       = false;
+		uint64_t                         epoch              = 0;
+		bool                             valid              = false;
+		RenderColorInfo                  result;
+	};
+	std::array<ColorTargetMemo, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_memos;
+	struct DepthTargetMemo {
+		std::array<uint32_t, 64> registers {};
+		uint64_t                 epoch = 0;
+		bool                     valid = false;
+		TextureCache::ImageDesc  desc;
+		ImageId                  image_id;
+	};
+	DepthTargetMemo m_depth_target_memo;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <functional>
@@ -27,6 +28,35 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
+
+namespace {
+
+std::atomic_bool     g_hardware_storage_buffer_bounds {false};
+std::atomic_uint32_t g_compute_shared_memory_limit {0};
+std::atomic_uint32_t g_mesh_shared_memory_limit {0};
+
+} // namespace
+
+void SetHardwareStorageBufferBounds(bool enabled) {
+	g_hardware_storage_buffer_bounds.store(enabled, std::memory_order_relaxed);
+}
+
+bool HardwareStorageBufferBounds() {
+	return g_hardware_storage_buffer_bounds.load(std::memory_order_relaxed);
+}
+
+void SetSharedMemoryLimits(uint32_t compute_bytes, uint32_t mesh_bytes) {
+	g_compute_shared_memory_limit.store(compute_bytes, std::memory_order_relaxed);
+	g_mesh_shared_memory_limit.store(mesh_bytes, std::memory_order_relaxed);
+}
+
+uint32_t ComputeSharedMemoryLimit() {
+	return g_compute_shared_memory_limit.load(std::memory_order_relaxed);
+}
+
+uint32_t MeshSharedMemoryLimit() {
+	return g_mesh_shared_memory_limit.load(std::memory_order_relaxed);
+}
 
 namespace {
 

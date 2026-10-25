@@ -48,6 +48,18 @@
 
 namespace Libs::Graphics {
 
+// PERF-INSTR: a debug label naming the shaders, for GPU crash analysis (KYTY_RGD_LABELS).
+static void RgdLabel(vk::CommandBuffer command, const char* kind, uint64_t a, uint64_t b) {
+	static const bool enabled = std::getenv("KYTY_RGD_LABELS") != nullptr;
+	if (!enabled) return;
+	char text[96];
+	std::snprintf(text, sizeof(text), "%s %016llx %016llx", kind, static_cast<unsigned long long>(a),
+	              static_cast<unsigned long long>(b));
+	vk::DebugUtilsLabelEXT label {};
+	label.pLabelName = text;
+	command.insertDebugUtilsLabelEXT(&label);
+}
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -1202,6 +1214,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	RgdLabel(vk_buffer, mesh_active ? "MS/PS" : "VS/PS", // PERF-INSTR
+	         state.vertex_info[0].stage.module->info.shader_hash, // PERF-INSTR
+	         state.ps_active && state.ps_input_info.stage.module != nullptr // PERF-INSTR
+	             ? state.ps_input_info.stage.module->info.shader_hash : 0u); // PERF-INSTR
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	if (mesh_active) {

@@ -3,11 +3,14 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -26,6 +29,9 @@ public:
 	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Hands submissions to a thread that calls vkQueueSubmit, so recording continues meanwhile.
+	// Submissions that use other semaphores still submit in place, after the queued ones.
+	void           EnableAsyncSubmit();
 	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
@@ -82,7 +88,24 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct PendingSubmit {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo        info;
+		uint64_t          tick            = 0;
+		uint32_t          debug_op        = 0;
+		uint64_t          debug_submit_id = 0;
+		uint32_t          debug_arg0      = 0;
+		uint32_t          debug_arg1      = 0;
+		uint32_t          debug_arg2      = 0;
+		uint32_t          debug_arg3      = 0;
+		uint64_t          debug_arg4      = 0;
+	};
+
 	void BeginNext();
+	void QueueSubmit(const PendingSubmit& submit);
+	void SubmitThread(std::stop_token stop);
+	void DrainSubmits();
+	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -101,6 +124,15 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::deque<PendingSubmit>    m_submits;
+	std::mutex                   m_submit_mutex;
+	std::condition_variable      m_submit_available;
+	std::condition_variable      m_submit_drained;
+	bool                         m_async_submit = false;
+	std::jthread                 m_submit_thread;
+	// Deferred recording: the GPU thread's commands and submits, recorded and submitted in
+	// order by the submit thread (see CommandStream). Null when commands are recorded directly.
+	std::unique_ptr<CommandStream> m_stream;
 };
 
 } // namespace Libs::Graphics

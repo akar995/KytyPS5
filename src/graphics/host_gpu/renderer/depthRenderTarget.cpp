@@ -24,7 +24,9 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -309,7 +311,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -346,8 +347,31 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
+	// The target description depends only on these registers and on device capabilities; it
+	// changes a few dozen times a frame while thousands of draws reuse it.
+	using Registers = std::remove_cvref_t<decltype(z)>;
+	static_assert(std::is_trivially_copyable_v<Registers> &&
+	              sizeof(Registers) <= sizeof(DepthTargetMemo::registers));
 	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	auto& memo  = m_depth_target_memo;
+	if (memo.valid && std::memcmp(memo.registers.data(), &z, sizeof(Registers)) == 0 &&
+	    cache.ImageSetUnchanged(memo.epoch, memo.desc.info.data) &&
+	    !graphics_debug_dump_enabled()) {
+		r.desc     = memo.desc;
+		r.image_id = cache.RefindImage(memo.image_id, r.desc);
+		memo.epoch = cache.ImageSetEpoch();
+	} else {
+		r.desc     = MakeDepthTargetDesc(buffer, z);
+		bool direct = false;
+		r.image_id = cache.FindImage(r.desc, false, &direct);
+		memo.valid = direct;
+		if (direct) {
+			std::memcpy(memo.registers.data(), &z, sizeof(Registers));
+			memo.epoch    = cache.ImageSetEpoch();
+			memo.desc     = r.desc;
+			memo.image_id = r.image_id;
+		}
+	}
 	BindRenderTarget(r.image_id);
 }
 
