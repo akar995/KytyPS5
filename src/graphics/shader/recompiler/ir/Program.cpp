@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 
+#include <atomic>
 #include <fmt/format.h>
 #include <xbyak/xbyak.h>
 #include <map>
@@ -100,7 +101,10 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 
 } // namespace
 
-ResourcePlan::ResourcePlan() = default;
+ResourcePlan::ResourcePlan() {
+	static std::atomic<uint64_t> next_scratch_id {1};
+	scratch_id = next_scratch_id.fetch_add(1, std::memory_order_relaxed);
+}
 ResourcePlan::ResourcePlan(ResourcePlan&&) noexcept = default;
 
 ResourcePlan::~ResourcePlan() {

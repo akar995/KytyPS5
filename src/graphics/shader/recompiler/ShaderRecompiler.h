@@ -75,6 +75,15 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
                                            const IR::ResourceSpecialization& specialization,
 	                                       uint32_t push_data_start_dword = 0);
 
+// Whether the device reads zero for storage-buffer loads outside the bound range
+// (robustBufferAccess2), so compiled loads need no explicit bounds check. Set once per device.
+void               SetHardwareStorageBufferBounds(bool enabled);
+[[nodiscard]] bool HardwareStorageBufferBounds();
+// The device's workgroup memory limits in bytes; zero while unknown.
+void                   SetSharedMemoryLimits(uint32_t compute_bytes, uint32_t mesh_bytes);
+[[nodiscard]] uint32_t ComputeSharedMemoryLimit();
+[[nodiscard]] uint32_t MeshSharedMemoryLimit();
+
 } // namespace Libs::Graphics::ShaderRecompiler
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERRECOMPILER_H_ */

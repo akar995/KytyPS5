@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib> // PERF-INSTR
 #include <unordered_map>
 #include <utility>
 
@@ -1396,6 +1397,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
+			if (std::getenv("KYTY_EXP_CONST_VCOUNT") != nullptr) vertex_count = IR::U32(IR::Value(options.wave_size)); // PERF-INSTR
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),

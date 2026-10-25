@@ -1,8 +1,11 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/perfCounters.h" // PERF-INSTR
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -100,6 +103,8 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	// The submit thread waits on a condition the jthread destructor would not signal.
+	StopSubmitThread();
 }
 
 void CommandScheduler::Shutdown() {
@@ -125,6 +130,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
+	StopSubmitThread();
 	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
 	DrainPriorityOperations();
@@ -182,6 +188,8 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
+	Common::Perf::Add(Common::Perf::GpuWaits); // PERF-INSTR
+	Common::Perf::ScopedTimer perf_timer(Common::Perf::GpuWaitNs); // PERF-INSTR
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -192,6 +200,8 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	Common::Perf::Add(Common::Perf::GpuWaits); // PERF-INSTR
+	Common::Perf::ScopedTimer perf_timer(Common::Perf::GpuWaitNs); // PERF-INSTR
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -333,6 +343,13 @@ CommandBuffer& CommandScheduler::Current() {
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	if (m_async_submit) {
+		MarkCommandHookThread();
+	}
+	if (m_stream != nullptr) {
+		// Its Begin and every command recorded into it go through the stream.
+		m_stream->Route(m_command.m_buffer);
+	}
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	return m_command;
@@ -342,18 +359,59 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	EXIT_IF(m_graphics.queue == nullptr);
 
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetBufferCache().BeforeSubmit();
+	}
+	// Command buffers end here: their pool is only used by this thread.
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	// Other semaphores order this submission against other queue users, so it cannot wait in
+	// the queue behind them.
+	const bool external = submit.num_wait_semaphores != 0 || submit.num_signal_semaphores != 0;
+	// Ticks are taken in submission order, which the submit thread keeps.
+	const auto tick = m_master.NextTick();
+	submit.AddSignal(m_master.Handle(), tick);
+	PendingSubmit pending {
+	    .buffer          = m_command.m_buffer,
+	    .info            = submit,
+	    .tick            = tick,
+	    .debug_op        = m_command.m_debug_op,
+	    .debug_submit_id = m_command.m_debug_submit_id,
+	    .debug_arg0      = m_command.m_debug_arg0,
+	    .debug_arg1      = m_command.m_debug_arg1,
+	    .debug_arg2      = m_command.m_debug_arg2,
+	    .debug_arg3      = m_command.m_debug_arg3,
+	    .debug_arg4      = m_command.m_debug_arg4,
+	};
+	if (m_stream != nullptr) {
+		// End was the buffer's last command.
+		m_stream->Route(VK_NULL_HANDLE);
+	}
+	if (m_async_submit && !external && m_stream != nullptr) {
+		// The submit thread records the stream's commands and submits in order.
+		m_stream->Push([this, pending] { QueueSubmit(pending); });
+		m_stream->Wake();
+	} else if (m_async_submit && !external) {
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_submits.push_back(pending);
+		}
+		m_submit_available.notify_one();
+	} else {
+		DrainSubmits();
+		QueueSubmit(pending);
+	}
 
-	vk::Result result;
-	uint64_t   tick;
+	m_command.m_buffer = nullptr;
+	return tick;
+}
+
+void CommandScheduler::QueueSubmit(const PendingSubmit& pending) {
+	const auto& submit = pending.info;
+	vk::Result  result;
 	{
-		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
+		Common::LockGuard lock(m_graphics.queue_mutex);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -367,23 +425,87 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
 		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.pCommandBuffers      = &pending.buffer;
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = m_graphics.queue.submit(1, &submit_info, nullptr);
 	}
 
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, pending.tick, pending.debug_op,
+		                  pending.debug_submit_id, pending.debug_arg0, pending.debug_arg1,
+		                  pending.debug_arg2, pending.debug_arg3, pending.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
 
-	m_command.m_buffer = nullptr;
-	return tick;
+void CommandScheduler::EnableAsyncSubmit() {
+	EXIT_IF(m_async_submit);
+	InstallCommandHooks();
+	if (CommandRecordingDeferred()) {
+		m_stream = std::make_unique<CommandStream>();
+	}
+	m_async_submit  = true;
+	m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	if (m_stream != nullptr) {
+		m_stream->Consume(stop);
+		return;
+	}
+	for (;;) {
+		PendingSubmit pending;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			m_submit_available.wait(lock,
+			                        [&] { return !m_submits.empty() || stop.stop_requested(); });
+			if (m_submits.empty()) {
+				return;
+			}
+			pending = m_submits.front();
+		}
+		QueueSubmit(pending);
+		{
+			// Popped only now: DrainSubmits waits until submissions are in the queue.
+			std::lock_guard lock(m_submit_mutex);
+			m_submits.pop_front();
+		}
+		m_submit_drained.notify_all();
+	}
+}
+
+void CommandScheduler::DrainSubmits() {
+	if (!m_async_submit) {
+		return;
+	}
+	if (m_stream != nullptr) {
+		m_stream->Drain();
+		return;
+	}
+	std::unique_lock lock(m_submit_mutex);
+	m_submit_drained.wait(lock, [this] { return m_submits.empty(); });
+}
+
+void CommandScheduler::StopSubmitThread() {
+	if (!m_async_submit) {
+		return;
+	}
+	DrainSubmits();
+	m_submit_thread.request_stop();
+	{
+		std::lock_guard lock(m_submit_mutex);
+	}
+	m_submit_available.notify_all();
+	if (m_stream != nullptr) {
+		m_stream->Wake();
+	}
+	if (m_submit_thread.joinable()) {
+		m_submit_thread.join();
+	}
+	m_stream.reset();
+	m_async_submit = false;
 }
 
 void CommandScheduler::BeginNext() {

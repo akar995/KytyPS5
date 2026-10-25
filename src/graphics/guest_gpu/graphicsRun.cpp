@@ -21,9 +21,13 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include "graphics/host_gpu/renderer/gpuProfiler.h" // PERF-INSTR
+#include "common/perfCounters.h" // PERF-INSTR
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -52,6 +56,14 @@ struct DrawIndexedIndirectArgs {
 	uint32_t base_vertex_location;
 	uint32_t start_instance_location;
 };
+
+// Reads guest memory the GPU may have written, waiting for the GPU only when these bytes are
+// GPU-written; a plain read would wait whenever its page holds any GPU-written data.
+static void ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size) {
+	if (!LibKernel::Memory::TryReadBufferBacking(vaddr, data, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	}
+}
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -205,8 +217,12 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_num_instances_addr               = 0;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
+	m_scan_valid                       = false;
+	m_scan_resume                      = false;
+	m_renderer.GetPipelineCache().DropDrawRecords();
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
 
@@ -443,6 +459,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::Thread::DedicateCore(0);
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -456,7 +473,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const auto perf_idle0 = Common::Perf::NowNs(); // PERF-INSTR
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::Perf::Add(Common::Perf::GpuThreadIdleNs, Common::Perf::NowNs() - perf_idle0); // PERF-INSTR
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -478,7 +497,9 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					const auto perf_block0 = Common::Perf::NowNs(); // PERF-INSTR
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					Common::Perf::Add(Common::Perf::FlipWaitNs, Common::Perf::NowNs() - perf_block0); // PERF-INSTR
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -628,6 +649,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	// Records of an earlier execution's draws would never match this one's packets.
+	m_renderer.GetPipelineCache().DropDrawRecords();
+	m_scan_valid  = false;
+	m_scan_resume = false;
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -659,6 +684,338 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
+}
+
+static uint64_t g_peek_block[258]; // PERF-INSTR
+static uint64_t g_peek_calls; // PERF-INSTR
+static void PeekNote(uint32_t what) { // PERF-INSTR
+	g_peek_block[what]++; // PERF-INSTR
+	if (++g_peek_calls % 200000 == 0) { // PERF-INSTR
+		std::fprintf(stderr, "PEEK calls=%llu ok=%llu nondraw=%llu", (unsigned long long)g_peek_calls, (unsigned long long)g_peek_block[256], (unsigned long long)g_peek_block[257]); // PERF-INSTR
+		for (int i = 0; i < 256; i++) if (g_peek_block[i] * 100 > g_peek_calls) std::fprintf(stderr, " op%02x=%llu", i, (unsigned long long)g_peek_block[i]); // PERF-INSTR
+		std::fprintf(stderr, "\n"); // PERF-INSTR
+	} // PERF-INSTR
+} // PERF-INSTR
+NextDrawRegisters CommandProcessor::PeekNextDraw() {
+	if (g_current_execution == nullptr || g_current_execution->m_buffer_stack.empty()) {
+		return {};
+	}
+	const auto& cursor   = g_current_execution->m_buffer_stack.back();
+	const auto  commands = cursor.commands;
+	const auto  total_dw = static_cast<uint32_t>(commands.size());
+	if (cursor.offset_dw >= total_dw) {
+		return {};
+	}
+	// Indirect draws loop over their records with patched registers; their next draw is not the
+	// next packet's.
+	switch ((commands[cursor.offset_dw] >> 8u) & 0xffu) {
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO: break;
+		default:
+			PeekNote(257); // PERF-INSTR
+			return {};
+	}
+	const auto first = cursor.offset_dw + KYTY_PM4_LEN(commands[cursor.offset_dw]);
+	auto       end   = first;
+	for (;;) {
+		if (end >= total_dw) {
+			return {};
+		}
+		const auto header = commands[end];
+		if (header == 0x80000000u) {
+			end++;
+			continue;
+		}
+		const auto opcode = (header >> 8u) & 0xffu;
+		const auto length = KYTY_PM4_LEN(header);
+		if ((header & 1u) != 0 || length < 2 || length > total_dw - end) {
+			return {};
+		}
+		if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+		    opcode == Pm4::IT_DRAW_INDEX_AUTO) {
+			break;
+		}
+		// The copies must be exactly the next draw's registers: preparing programs follows
+		// pointers in their user data, so a mix of old and new registers could read garbage.
+		// Register packets are applied to the copies below. Index and instance packets set no
+		// registers, and markers only annotate. Anything else could change state the copies do
+		// not see, or memory the programs read.
+		switch (opcode) {
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX:
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+			case Pm4::IT_INDEX_TYPE:
+			case Pm4::IT_INDEX_BASE:
+			case Pm4::IT_INDEX_BUFFER_SIZE:
+			case Pm4::IT_NUM_INSTANCES: break;
+			case Pm4::IT_NOP:
+				if (KYTY_PM4_R(header) == Pm4::R_PUSH_MARKER ||
+				    KYTY_PM4_R(header) == Pm4::R_POP_MARKER) {
+					break;
+				}
+				PeekNote(opcode); // PERF-INSTR
+				return {};
+			default:
+				PeekNote(opcode); // PERF-INSTR
+				return {};
+		}
+		end += length;
+	}
+	// The regular handlers write the copies; besides registers they touch only the user data
+	// marker and, for index-type registers, the index state, both restored afterwards.
+	m_next_sh_ctx         = m_sh_ctx;
+	const auto marker     = m_user_data_marker;
+	const auto index_type = m_index_type_and_size;
+	m_sh_target           = &m_next_sh_ctx;
+	for (auto offset = first; offset < end;) {
+		const auto header = commands[offset];
+		if (header == 0x80000000u) {
+			offset++;
+			continue;
+		}
+		const auto  opcode    = (header >> 8u) & 0xffu;
+		const auto* payload   = commands.data() + offset + 1;
+		const auto  remaining = total_dw - offset;
+		switch (opcode) {
+			case Pm4::IT_SET_SH_REG:
+				(void)CpOpSetShaderReg(*this, header & ~1u, payload, remaining, total_dw);
+				break;
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+				(void)CpOpIndirectShRegs(*this, header & ~1u, payload, remaining, total_dw);
+				break;
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+				if (m_ctx_target == &m_ctx) {
+					m_next_ctx   = m_ctx;
+					m_ctx_target = &m_next_ctx;
+				}
+				(void)(opcode == Pm4::IT_SET_CONTEXT_REG
+				           ? CpOpSetContextReg(*this, header & ~1u, payload, remaining, total_dw)
+				           : CpOpIndirectCxRegs(*this, header & ~1u, payload, remaining, total_dw));
+				break;
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX:
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+				if (m_ucfg_target == &m_ucfg) {
+					m_next_ucfg   = m_ucfg;
+					m_ucfg_target = &m_next_ucfg;
+				}
+				(void)(opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT
+				           ? CpOpIndirectUcRegs(*this, header & ~1u, payload, remaining, total_dw)
+				           : CpOpSetUconfigReg(*this, header & ~1u, payload, remaining, total_dw));
+				break;
+			default: break;
+		}
+		offset += KYTY_PM4_LEN(header);
+	}
+	const NextDrawRegisters next {&m_next_sh_ctx, m_ctx_target, m_ucfg_target};
+	m_sh_target           = &m_sh_ctx;
+	m_ctx_target          = &m_ctx;
+	m_ucfg_target         = &m_ucfg;
+	m_user_data_marker    = marker;
+	m_index_type_and_size = index_type;
+	PeekNote(256); // PERF-INSTR
+	return next;
+}
+
+void CommandProcessor::ScanDrawsAhead(bool at_draw) {
+	Common::Perf::ScopedTimer perf_scan_timer(Common::Perf::Phase0Ns); // PERF-INSTR
+	auto& cache = m_renderer.GetPipelineCache();
+	if (!cache.DrawLookaheadEnabled() || g_current_execution == nullptr ||
+	    g_current_execution->m_buffer_stack.empty()) {
+		return;
+	}
+	const auto& cursor   = g_current_execution->m_buffer_stack.back();
+	const auto  commands = cursor.commands;
+	const auto  total_dw = static_cast<uint32_t>(commands.size());
+	const auto  is_draw  = [](uint32_t opcode) {
+		return opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+		       opcode == Pm4::IT_DRAW_INDEX_AUTO || opcode == Pm4::IT_DISPATCH_DIRECT ||
+		       opcode == Pm4::IT_DISPATCH_INDIRECT;
+	};
+	if (m_scan_resume && m_scan_buffer == commands.data() && cursor.offset_dw < m_scan_offset) {
+		// Stopped at a packet ahead of the cursor: the draws up to it are recorded already.
+		return;
+	}
+	m_scan_resume = false;
+	if (!m_scan_valid || m_scan_buffer != commands.data() || m_scan_offset < cursor.offset_dw ||
+	    m_scan_offset > total_dw) {
+		// The copies become the live registers at the cursor.
+		if (cursor.offset_dw >= total_dw) {
+			return;
+		}
+		m_scan_buffer = commands.data();
+		m_scan_offset = cursor.offset_dw;
+		if (at_draw) {
+			const auto header = commands[cursor.offset_dw];
+			if (!is_draw((header >> 8u) & 0xffu)) {
+				// An indirect draw patches registers as it runs; scan after it.
+				m_scan_valid  = false;
+				m_scan_resume = true;
+				m_scan_offset = cursor.offset_dw + KYTY_PM4_LEN(header);
+				return;
+			}
+			m_scan_offset += KYTY_PM4_LEN(header);
+		}
+		m_next_sh_ctx        = m_sh_ctx;
+		m_next_ctx           = m_ctx;
+		m_next_ucfg          = m_ucfg;
+		m_scan_valid         = true;
+		m_scan_context_dirty = true;
+	}
+	// The regular handlers write the copies; besides registers they touch only the user data
+	// marker and, for index-type registers, the index state, both restored afterwards.
+	const auto marker     = m_user_data_marker;
+	const auto index_type = m_index_type_and_size;
+	m_sh_target           = &m_next_sh_ctx;
+	m_ctx_target          = &m_next_ctx;
+	m_ucfg_target         = &m_next_ucfg;
+	while (m_scan_offset < total_dw) {
+		const auto header = commands[m_scan_offset];
+		if (header == 0x80000000u) {
+			m_scan_offset++;
+			continue;
+		}
+		const auto opcode = (header >> 8u) & 0xffu;
+		const auto length = KYTY_PM4_LEN(header);
+		if ((header & 1u) != 0 || length < 2 || length > total_dw - m_scan_offset) {
+			// Predicated or malformed: the regular pass decides; scan again after it.
+			m_scan_valid  = false;
+			m_scan_resume = true;
+			break;
+		}
+		const auto* payload   = commands.data() + m_scan_offset + 1;
+		const auto  remaining = total_dw - m_scan_offset;
+		bool        blocked   = false;
+		if (is_draw(opcode)) {
+			PipelineCache::DrawRecordInfo info {};
+			info.buffer       = commands.data();
+			info.offset       = m_scan_offset;
+			info.memory_epoch = m_renderer.MemoryEpoch();
+			bool empty        = false;
+			if (opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_DISPATCH_INDIRECT) {
+				info.compute  = true;
+				info.mode     = payload[length - 2];
+				info.indirect = opcode == Pm4::IT_DISPATCH_INDIRECT;
+				if (info.indirect) {
+					// Its groups come from memory as it runs.
+					blocked = (info.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+				} else {
+					info.groups = {payload[0], payload[1], payload[2]};
+					empty       = payload[0] == 0 || payload[1] == 0 || payload[2] == 0;
+				}
+				if (!blocked) {
+					// As the dispatch does before it looks at the compute registers.
+					m_next_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(info.mode));
+				}
+			} else {
+				// A draw of no indices returns before it needs programs.
+				empty = (opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 && payload[2] == 0) ||
+				        (opcode == Pm4::IT_DRAW_INDEX_AUTO && payload[0] == 0);
+			}
+			if (!blocked && empty) {
+				m_scan_offset += length;
+				continue;
+			}
+			auto* registers = blocked ? nullptr : cache.AcquireDrawRecord();
+			if (!blocked && registers == nullptr) {
+				// Ring full: the copies stay valid here until the next scan.
+				break;
+			}
+			if (!blocked) {
+				registers->shaders     = m_next_sh_ctx;
+				registers->user_config = m_next_ucfg;
+				cache.PostDrawRecord(registers, info, m_next_ctx, m_scan_context_dirty);
+				m_scan_context_dirty = false;
+			}
+		} else {
+			switch (opcode) {
+				case Pm4::IT_SET_SH_REG:
+					(void)CpOpSetShaderReg(*this, header & ~1u, payload, remaining, total_dw);
+					break;
+				case Pm4::IT_SET_SH_REG_INDIRECT:
+					(void)CpOpIndirectShRegs(*this, header & ~1u, payload, remaining, total_dw);
+					break;
+				case Pm4::IT_SET_CONTEXT_REG:
+					(void)CpOpSetContextReg(*this, header & ~1u, payload, remaining, total_dw);
+					m_scan_context_dirty = true;
+					break;
+				case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+					(void)CpOpIndirectCxRegs(*this, header & ~1u, payload, remaining, total_dw);
+					m_scan_context_dirty = true;
+					break;
+				case Pm4::IT_SET_UCONFIG_REG:
+				case Pm4::IT_SET_UCONFIG_REG_INDEX:
+					(void)CpOpSetUconfigReg(*this, header & ~1u, payload, remaining, total_dw);
+					break;
+				case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+					(void)CpOpIndirectUcRegs(*this, header & ~1u, payload, remaining, total_dw);
+					break;
+				case Pm4::IT_INDEX_TYPE:
+				case Pm4::IT_INDEX_BASE:
+				case Pm4::IT_INDEX_BUFFER_SIZE:
+				case Pm4::IT_NUM_INSTANCES:
+				// Acquire-memory packets only order caches (CpOpAcquireMem consumes them).
+				case Pm4::IT_ACQUIRE_MEM: break;
+				case Pm4::IT_NOP: {
+					// Markers only annotate; end-of-pipe fences and cache flushes write no
+					// register and no memory the programs read.
+					const auto custom = KYTY_PM4_R(header);
+					blocked = custom != Pm4::R_PUSH_MARKER && custom != Pm4::R_POP_MARKER &&
+					          custom != Pm4::R_RELEASE_MEM;
+					break;
+				}
+				default: blocked = true; break;
+			}
+		}
+		if (blocked) {
+			// Anything else could change state the copies do not see, or memory the programs
+			// read; the scan continues from the live registers once the cursor has passed it.
+			m_scan_valid  = false;
+			m_scan_resume = true;
+			break;
+		}
+		m_scan_offset += length;
+	}
+	m_sh_target           = &m_sh_ctx;
+	m_ctx_target          = &m_ctx;
+	m_ucfg_target         = &m_ucfg;
+	m_user_data_marker    = marker;
+	m_index_type_and_size = index_type;
+	cache.PublishDrawRecords();
+}
+
+PipelineCache::DrawRecord* CommandProcessor::BeginRecordedPacket(bool peek) {
+	auto& executor = m_renderer.GetRenderExecutor();
+	auto& cache    = m_renderer.GetPipelineCache();
+	PipelineCache::DrawRecord* record = nullptr;
+	if (cache.DrawLookaheadEnabled() && g_current_execution != nullptr &&
+	    !g_current_execution->m_buffer_stack.empty()) {
+		const auto& cursor = g_current_execution->m_buffer_stack.back();
+		{ // PERF-INSTR
+		Common::Perf::ScopedTimer perf_take_timer(Common::Perf::Phase1Ns); // PERF-INSTR
+		record = cache.TakeDrawRecord(cursor.commands.data(), cursor.offset_dw);
+		} // PERF-INSTR
+		ScanDrawsAhead(true);
+	} else if (peek) {
+		executor.SetNextDraw(PeekNextDraw());
+	}
+	executor.SetDrawRecord(record);
+	return record;
+}
+
+void CommandProcessor::EndRecordedPacket(PipelineCache::DrawRecord* record) {
+	auto& executor = m_renderer.GetRenderExecutor();
+	executor.SetDrawRecord(nullptr);
+	executor.SetNextDraw({});
+	if (record != nullptr) {
+		m_renderer.GetPipelineCache().ReleaseDrawRecord(record);
+	}
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
@@ -694,7 +1051,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+		if ((packet_header & 1u) != 0) Common::Perf::Add(Common::Perf::PredicatedDraws); // PERF-INSTR
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			Common::Perf::Add(Common::Perf::SkippedDraws); // PERF-INSTR
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
@@ -747,6 +1106,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (m_scan_resume && cursor.offset_dw >= m_scan_offset &&
+		    execution.m_next_buffer.empty()) {
+			ScanDrawsAhead(false);
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
@@ -785,7 +1148,16 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances      = num_instances;
+	m_num_instances_addr = 0;
+}
+
+uint32_t CommandProcessor::NumInstances() {
+	if (m_num_instances_addr != 0) {
+		ReadGuestMemory(m_num_instances_addr, &m_num_instances, sizeof(m_num_instances));
+		m_num_instances_addr = 0;
+	}
+	return m_num_instances;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -799,6 +1171,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			Common::Perf::Add(Common::Perf::Predications); // PERF-INSTR
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
@@ -839,16 +1212,36 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// Submitting every few draws keeps the GPU busy while the CPU records the rest, and bounds how
+// much queued work a forced synchronization has to wait for. Submission happens on another
+// thread, so frequent submits cost the recording thread little.
+static void CountRecordedWork(CommandProcessor& cp) {
+	constexpr uint32_t           Threshold = 10;
+	static thread_local uint32_t recorded  = 0;
+	if (++recorded >= Threshold) {
+		// Submitting ends the open render pass, and the GPU then stores and reloads all of its
+		// attachments. Passes end often on their own, so wait for that within a bound.
+		if (cp.InRenderPass() && recorded < Threshold * 4u) {
+			return;
+		}
+		recorded = 0;
+		cp.BufferFlush();
+	}
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
+	auto* record = BeginRecordedPacket(true);
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	EndRecordedPacket(record);
+	CountRecordedWork(*this);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -884,6 +1277,42 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
+	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
+	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+
+	const auto args_vaddr = m_draw_indirect_args_base_addr + data_offset;
+	auto&      executor   = m_renderer.GetRenderExecutor();
+
+	// Reading a GPU-written record on the CPU waits for the GPU to drain; let the host GPU
+	// consume it instead, unless shaders take the record's offsets in user SGPRs, which only
+	// the CPU path writes. The instance count it leaves behind is read only if needed.
+	const bool patches_registers = registers.vertex_offset != Pm4::SH_NOP ||
+	                               registers.instance_offset != Pm4::SH_NOP ||
+	                               registers.index_offset != Pm4::SH_NOP;
+	if (!patches_registers && !indexed &&
+	    executor.CanDrawIndirectOnGpu(CurrentBuffer(), args_vaddr, sizeof(DrawIndirectArgs))) {
+		m_num_instances_addr = args_vaddr + offsetof(DrawIndirectArgs, instance_count);
+		DrawIndexAuto({.vertex_count       = 1,
+		               .instance_count     = 1,
+		               .offset_source      = DrawOffsetSource::IndirectArgs,
+		               .indirect_args_addr = args_vaddr});
+		return;
+	}
+	// The GPU path binds the whole index buffer, so its size must be known and sane.
+	const uint64_t index_bytes =
+	    static_cast<uint64_t>(m_index_buffer_size) * (m_index_type_and_size == 1 ? 4u : 2u);
+	if (!patches_registers && indexed && m_index_buffer_size != 0 && m_index_type_and_size != 2 &&
+	    index_bytes <= 256ull * 1024 * 1024 && m_renderer.IsMapped(m_index_base_addr, index_bytes) &&
+	    executor.CanDrawIndirectOnGpu(CurrentBuffer(), args_vaddr,
+	                                  sizeof(DrawIndexedIndirectArgs))) {
+		m_num_instances_addr = args_vaddr + offsetof(DrawIndexedIndirectArgs, instance_count);
+		DrawIndex({.index_count        = m_index_buffer_size,
+		           .index_addr         = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count     = 1,
+		           .offset_source      = DrawOffsetSource::IndirectArgs,
+		           .indirect_args_addr = args_vaddr});
+		return;
+	}
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
@@ -897,7 +1326,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
-		draw_count = *count_addr;
+		ReadGuestMemory(reinterpret_cast<uint64_t>(count_addr), &draw_count, sizeof(draw_count));
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
@@ -906,6 +1335,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	if (draw_count == 0) {
 		return;
 	}
+	m_num_instances_addr = 0;
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
@@ -925,7 +1355,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
 		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			DrawIndirectArgs record {};
+			ReadGuestMemory(args_addr, &record, sizeof(record));
+			const auto* args = &record;
 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
 			                         args->start_instance_location, 0);
 			m_num_instances = args->instance_count;
@@ -937,7 +1369,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			continue;
 		}
 
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		DrawIndexedIndirectArgs record {};
+		ReadGuestMemory(args_addr, &record, sizeof(record));
+		const auto* args = &record;
 		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
 		                         args->start_instance_location, args->start_index_location);
 
@@ -993,28 +1427,38 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		auto* record = BeginRecordedPacket(false);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
+		EndRecordedPacket(record);
 	}
+	CountRecordedWork(*this);
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		vk::DispatchIndirectCommand args {};
+		ReadGuestMemory(args_addr, &args, sizeof(args));
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	auto* record = BeginRecordedPacket(false);
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
+	EndRecordedPacket(record);
+	CountRecordedWork(*this);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
+	auto* record = BeginRecordedPacket(true);
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	EndRecordedPacket(record);
+	CountRecordedWork(*this);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1223,6 +1667,10 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	auto& buffer = CurrentBuffer();
+	if (buffer.FollowsGlobalBarrier()) {
+		return;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1234,7 +1682,9 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	GpuProfNote(GpuProfBarrier); // PERF-INSTR
+	buffer.Handle().pipelineBarrier2(dependency);
+	buffer.MarkGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1295,6 +1745,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			     event_type, event_index);
 			break;
 		case 0x00000039: {
+			Common::Perf::Add(Common::Perf::ZpassDumps); // PERF-INSTR
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
 				     "\n",

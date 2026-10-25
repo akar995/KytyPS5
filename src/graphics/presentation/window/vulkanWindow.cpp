@@ -60,6 +60,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputLayer         = VK_TRUE;
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
+	features.hostQueryReset = VK_TRUE; // PERF-INSTR
 	features.shaderBufferInt64Atomics  = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
@@ -594,6 +595,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
+	graphics.draw_indirect_first_instance_enabled = device_features.drawIndirectFirstInstance;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
@@ -614,6 +617,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
 	robustness2.pNext                              = &fragment_barycentric;
 #endif
+	graphics.robust_buffer_access2_enabled =
+	    supported_robustness2.robustBufferAccess2 != VK_FALSE;
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;

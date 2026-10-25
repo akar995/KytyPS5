@@ -15,6 +15,7 @@
 #include <array>
 #include <bit>
 #include <deque>
+#include <atomic>
 #include <list>
 #include <memory>
 #include <optional>
@@ -124,8 +125,10 @@ struct BufferResource {
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
 	uint32_t               image_alias        = NoImageAlias;
-	bool                   read               = false;
-	bool                   written            = false;
+	bool                   read               = false; // Loads or atomics.
+	bool                   written            = false; // Stores or atomics.
+	bool                   stored             = false; // Plain (non-atomic) stores.
+	bool                   loaded             = false; // Plain (non-atomic) loads.
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
@@ -348,6 +351,9 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Set in the element-size dword when dwords 4-5 instead hold the device address of the
+	// six draw dwords, written on the GPU for indirect draws.
+	static constexpr uint32_t MeshDrawIndirectFlag = 0x80000000u;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -624,6 +630,8 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+struct FastSrtPlan;
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -641,6 +649,8 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		// A completed unknown is (generation | 2, unknown_epoch); a new epoch retries them all.
+		uint64_t           unknown_epoch = 0;
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
 		uint8_t            read_policy = 0;
@@ -673,15 +683,31 @@ struct ResourcePlan {
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint8_t>            reachable_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<SelectorKeys>       selector_keys;
+	// Evaluation indices of value_storage: assigned when the plan is extracted, so that walks
+	// (on several threads at once) never assign them.
+	mutable uint32_t evaluation_value_count = 0;
+	// Identifies the plan to the walkers' per-thread scratch (SrtWalker), which keeps the
+	// memos, activity, material keys and fast-walk state of each walk.
+	uint64_t scratch_id = 0;
+	// Straight-line form of the SRT expressions, built on first use when the plan qualifies.
+	// Built once under a lock; readers see it once checked is set.
+	struct FastPlanSlot {
+		std::shared_ptr<FastSrtPlan> plan;
+		std::atomic<bool>            checked {false};
+
+		FastPlanSlot() = default;
+		FastPlanSlot(FastPlanSlot&& other) noexcept
+		    : plan(std::move(other.plan)), checked(other.checked.load()) {}
+		FastPlanSlot& operator=(FastPlanSlot&& other) noexcept {
+			plan = std::move(other.plan);
+			checked.store(other.checked.load());
+			return *this;
+		}
+	};
+	mutable FastPlanSlot fast_srt;
+	// Descriptor sources whose selector keys one materialization resolves once; the keys
+	// themselves are per-thread walk scratch (SrtWalker::SelectorKeys).
+	std::vector<SelectorKeys> selector_keys;
 };
 
 struct Program: ResourcePlan {

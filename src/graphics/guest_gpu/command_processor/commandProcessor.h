@@ -68,10 +68,13 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	[[nodiscard]] bool InRenderPass() { return CurrentBuffer().IsRendering(); }
 	void            BufferWait();
-	HW::Context&    GetCtx() { return m_ctx; }
-	HW::UserConfig& GetUcfg() { return m_ucfg; }
-	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	// The registers that register packets write: the live ones, or the next draw's copies while
+	// PeekNextDraw applies its packets.
+	HW::Context&    GetCtx() { return *m_ctx_target; }
+	HW::UserConfig& GetUcfg() { return *m_ucfg_target; }
+	HW::Shader&     GetShCtx() { return *m_sh_target; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
@@ -82,6 +85,7 @@ public:
 		return m_dispatch_indirect_args_base_addr;
 	}
 	void SetNumInstances(uint32_t num_instances);
+	[[nodiscard]] uint32_t NumInstances();
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
@@ -155,6 +159,17 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// The registers the draw after the current one will see, when only register and
+	// index/instance packets come between them; empty otherwise.
+	[[nodiscard]] NextDrawRegisters PeekNextDraw();
+	// Records the draws ahead of the cursor for the pipeline cache's lookahead, as far as only
+	// register, index and marker packets lie between them. at_draw: the cursor is on the draw
+	// executing now, which is skipped.
+	void ScanDrawsAhead(bool at_draw);
+	// Around a draw or dispatch: takes its lookahead record (or, without lookahead and with
+	// peek, posts the next draw's registers to the executor), then scans ahead.
+	[[nodiscard]] PipelineCache::DrawRecord* BeginRecordedPacket(bool peek);
+	void                                     EndRecordedPacket(PipelineCache::DrawRecord* record);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -164,6 +179,22 @@ private:
 	bool             m_context_state_pushed = false;
 	HW::UserConfig   m_ucfg;
 	HW::Shader       m_sh_ctx;
+	// The next draw's registers, which PeekNextDraw writes.
+	HW::Shader       m_next_sh_ctx;
+	HW::Context      m_next_ctx;
+	HW::UserConfig   m_next_ucfg;
+	HW::Shader*      m_sh_target   = &m_sh_ctx;
+	HW::Context*     m_ctx_target  = &m_ctx;
+	HW::UserConfig*  m_ucfg_target = &m_ucfg;
+	// Where ScanDrawsAhead continues: the next-draw copies hold the registers at that packet
+	// while m_scan_valid. With m_scan_resume it stopped at a packet it does not apply, and
+	// continues once the cursor has passed that packet.
+	const uint32_t* m_scan_buffer = nullptr;
+	uint32_t        m_scan_offset = 0;
+	bool            m_scan_valid  = false;
+	bool            m_scan_resume = false;
+	// A context packet changed the copies since the last record took a context snapshot.
+	bool            m_scan_context_dirty = true;
 	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;
 	uint32_t         m_index_type_and_size              = 0;
 	uint32_t         m_index_buffer_size                = 0;
@@ -172,6 +203,9 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Nonzero after a GPU-side indirect draw: m_num_instances is the value at this address,
+	// read only if a later draw uses it.
+	uint64_t m_num_instances_addr = 0;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

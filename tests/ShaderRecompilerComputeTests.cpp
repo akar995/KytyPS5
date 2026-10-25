@@ -315,6 +315,7 @@ struct TextureCacheTestAccess {
 
   static void AddPageOwner(TextureCache &cache, uint64_t address, ImageId id) {
     std::lock_guard lock(cache.m_lock);
+    cache.m_region_queries.clear();
     cache
         .m_image_page_table[static_cast<size_t>(
             address >> TextureCache::ImagePageTable::kPageBits)]
@@ -324,6 +325,7 @@ struct TextureCacheTestAccess {
   static bool RemovePageOwner(TextureCache &cache, uint64_t address,
                               ImageId id) {
     std::lock_guard lock(cache.m_lock);
+    cache.m_region_queries.clear();
     auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
     return owners != nullptr && owners->Erase(id);
@@ -331,6 +333,8 @@ struct TextureCacheTestAccess {
 
   static void SetQueryEpoch(TextureCache &cache, uint32_t epoch) {
     std::lock_guard lock(cache.m_lock);
+    // A remembered answer would skip the query whose epoch handling is under test.
+    cache.m_region_queries.clear();
     cache.m_image_query_epoch = epoch;
   }
 
@@ -2987,6 +2991,8 @@ public:
                     "submitted extra GPU work");
           }
 
+          // An interrupt is delivered when the submission holding it completes; processing
+          // flushes that submission whenever it stops, so the interrupt does not split it.
           auto gds_interrupt_only =
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
           Pm4Execution gds_interrupt_execution;
@@ -2997,7 +3003,7 @@ public:
               cache_and_counter_did_not_submit &&
               cb_db_release_did_not_submit &&
               interrupt_result == Pm4ProcessResult::Complete &&
-              gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
+              gpu_scheduler.CurrentTick() == interrupt_tick &&
               interrupt_only_gds_label == UINT64_MAX;
         });
         parser_complete.release();
@@ -3049,10 +3055,9 @@ public:
               processor->Process(immediate_execution, immediate);
           Require("GpuCommandLane", "32-bit release boundary",
                   immediate_result == Pm4ProcessResult::Complete &&
-                      gpu_scheduler.CurrentTick() ==
-                          immediate_tick + (interrupt == 1 || interrupt == 2) &&
+                      gpu_scheduler.CurrentTick() == immediate_tick &&
                       release_label == (interrupt == 1 ? 0 : 0x11223344u),
-                  "label-only release submitted work or interrupt release lost its boundary");
+                  "label or interrupt release submitted work");
         }
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
@@ -3067,8 +3072,8 @@ public:
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+        const bool interrupt_did_not_split =
+            gpu_scheduler.CurrentTick() == interrupt_tick;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -3081,7 +3086,7 @@ public:
         release_mem_submission_counts =
             gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            interrupt_did_not_split &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
@@ -14559,9 +14564,7 @@ public:
               read_only_depth.stencil_back.writeMask == 0 &&
               read_only_depth.stencil_front.passOp ==
                   vk::StencilOp::eKeep &&
-              !read_only_depth.AttachmentWriteAspects() &&
-              depth_attachment_layout(read_only_depth) ==
-                  vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+              !read_only_depth.AttachmentWriteAspects(),
           "a PS5 read-only depth/stencil target required write addresses or "
           "retained host writes");
 
@@ -14574,9 +14577,7 @@ public:
       Require(name, "read-only stencil clear suppression",
               read_only_clear_depth.image_id == phased_depth.image_id &&
                   !read_only_clear_depth.stencil_clear_enable &&
-                  !read_only_clear_depth.AttachmentWriteAspects() &&
-                  depth_attachment_layout(read_only_clear_depth) ==
-                      vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                  !read_only_clear_depth.AttachmentWriteAspects(),
               "a PS5 target-level stencil write disable retained a host clear");
 
       registers.SetDepthRenderTarget(phased_depth_target);
@@ -17191,7 +17192,7 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
+      return *context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
           topology, false,
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
@@ -26774,6 +26775,68 @@ TestCase Vop1MoveRelSource() {
           {0x33333333u},
           {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+// M0 comes from memory as a 3-bit field times 5, like Astro Bot's hottest pixel
+// shader. The recompiler keeps only the selects that such an M0 can reach.
+TestCase Vop1MoveRelSourceBoundedIndex() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSmemLoadOpcode(&code, 0x08, 4, 0);         // s_buffer_load_dword s4
+  AppendSMovLiteral(&code, 5, 0x0003000cu);        // offset 12, width 3
+  code.push_back(EncodeSop2(0x27, 6, 4, 5));       // s_bfe_u32 s6, s4, s5
+  code.push_back(EncodeSop2(0x26, 124, 6, InlineU32(5))); // s_mul_i32 m0, s6, 5
+  for (u32 index = 0; index < 40u; index++) {
+    AppendVMovLiteral(&code, 12 + index, 0x1000u + index);
+  }
+  code.push_back(0x7e6e870cu);                     // v_movrels_b32 v55, v12
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  // Bits 12-14 hold 6, so M0 = 30 and the result is v42.
+  return {"Vop1MoveRelSourceBoundedIndex",
+          code,
+          {0xa5a56a5au},
+          {0x1000u + 30u},
+          {O::S_BUFFER_LOAD_DWORD, O::S_MOV_B32, O::S_BFE_U32, O::S_MUL_I32,
+           O::V_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+// M0 comes from memory whole, so nothing bounds it: every register above the source is a
+// candidate, like Astro Bot's foliage vertex shader indexing a register array by a loop
+// counter. The emitter turns that long select chain into a switch on M0.
+TestCase Vop1MoveRelSourceUnboundedIndexCase(const char *name, u32 m0, u32 expected) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSmemLoadOpcode(&code, 0x08, 4, 0);         // s_buffer_load_dword s4
+  code.push_back(EncodeSMovB32(124, 4));           // s_mov_b32 m0, s4
+  for (u32 index = 0; index < 40u; index++) {
+    AppendVMovLiteral(&code, 12 + index, 0x1000u + index);
+  }
+  code.push_back(0x7e6e870cu);                     // v_movrels_b32 v55, v12
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  return {name,
+          code,
+          {m0},
+          {expected},
+          {O::S_BUFFER_LOAD_DWORD, O::S_MOV_B32, O::V_MOV_B32, O::V_MOVRELS_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase Vop1MoveRelSourceUnboundedIndex() {
+  return Vop1MoveRelSourceUnboundedIndexCase("Vop1MoveRelSourceUnboundedIndex", 30u,
+                                             0x1000u + 30u);
+}
+
+// Only M0's low 8 bits count, and the translation reads the source register for an index past
+// the last register (the switch's default, as the select chain's).
+TestCase Vop1MoveRelSourceIndexPastRegisters() {
+  return Vop1MoveRelSourceUnboundedIndexCase("Vop1MoveRelSourceIndexPastRegisters",
+                                             0xabcd01ffu, 0x1000u);
 }
 
 TestCase Vop1MoveRelDestination() {
@@ -41847,6 +41910,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  AddCase(Vop1MoveRelSourceBoundedIndex);
+  AddCase(Vop1MoveRelSourceUnboundedIndex);
+  AddCase(Vop1MoveRelSourceIndexPastRegisters);
   AddCase(Vop1MoveRelDestination);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
@@ -45454,35 +45520,50 @@ void CheckDynamicRenderingState() {
           rgba != depth,
           "depth/stencil formats did not participate in pipeline identity");
 
-  RenderDepthInfo attachment{};
-  attachment.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
-  Require("DynamicRenderingState", "read-only depth/stencil layout",
-          depth_attachment_layout(attachment) ==
+  const vk::ImageAspectFlags depth_aspect = vk::ImageAspectFlagBits::eDepth;
+  const vk::ImageAspectFlags stencil_aspect = vk::ImageAspectFlagBits::eStencil;
+  const auto depth_stencil_aspects = depth_aspect | stencil_aspect;
+  Require("DynamicRenderingState", "unsampled depth/stencil layout",
+          depth_attachment_layout(depth_stencil_aspects, {}, {}) ==
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal &&
+              depth_attachment_layout(depth_stencil_aspects, depth_aspect, {}) ==
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal,
+          "an unsampled depth/stencil target used a read-only layout");
+  Require("DynamicRenderingState", "sampled read-only depth/stencil layout",
+          depth_attachment_layout(depth_stencil_aspects, {}, depth_aspect) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
-          "fully read-only depth/stencil used a writable layout");
-  attachment.depth_load_clear_enable = true;
-  Require("DynamicRenderingState", "deferred depth clear layout",
-          depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
-          "a depth load clear used a read-only attachment layout");
-  attachment.depth_test_enable = true;
-  attachment.depth_write_enable = true;
-  Require("DynamicRenderingState", "depth-write stencil-read layout",
-          depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
-          "depth-only writes did not retain read-only stencil");
-  attachment.depth_load_clear_enable = false;
-  attachment.depth_write_enable = false;
-  attachment.stencil_clear_enable = true;
-  Require("DynamicRenderingState", "depth-read stencil-write layout",
-          depth_attachment_layout(attachment) ==
+          "a sampled target without writes used a writable layout");
+  Require("DynamicRenderingState", "sampled depth, written stencil layout",
+          depth_attachment_layout(depth_stencil_aspects, stencil_aspect,
+                                  depth_aspect) ==
               vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
-          "stencil-only writes did not retain read-only depth");
-  attachment.depth_write_enable = true;
-  Require("DynamicRenderingState", "writable depth/stencil layout",
-          depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthStencilAttachmentOptimal,
-          "combined depth/stencil writes did not use the writable layout");
+          "sampled depth with stencil writes did not split the aspects");
+  Require("DynamicRenderingState", "sampled stencil, written depth layout",
+          depth_attachment_layout(depth_stencil_aspects, depth_aspect,
+                                  stencil_aspect) ==
+              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
+          "sampled stencil with depth writes did not split the aspects");
+  Require("DynamicRenderingState", "single-aspect layouts",
+          depth_attachment_layout(depth_aspect, {}, {}) ==
+                  vk::ImageLayout::eDepthAttachmentOptimal &&
+              depth_attachment_layout(depth_aspect, {}, depth_aspect) ==
+                  vk::ImageLayout::eDepthReadOnlyOptimal &&
+              depth_attachment_layout(stencil_aspect, {}, {}) ==
+                  vk::ImageLayout::eStencilAttachmentOptimal &&
+              depth_attachment_layout(stencil_aspect, {}, stencil_aspect) ==
+                  vk::ImageLayout::eStencilReadOnlyOptimal,
+          "a single-aspect format used a combined depth/stencil layout");
+  Require("DynamicRenderingState", "kept depth/stencil layouts",
+          DepthAttachmentLayoutPermits(
+              vk::ImageLayout::eDepthStencilAttachmentOptimal, depth_aspect, {}) &&
+              DepthAttachmentLayoutPermits(
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal, {}, depth_aspect) &&
+              !DepthAttachmentLayoutPermits(
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth_aspect, {}) &&
+              !DepthAttachmentLayoutPermits(
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal, {}, depth_aspect) &&
+              !DepthAttachmentLayoutPermits(vk::ImageLayout::eGeneral, {}, {}),
+          "a kept attachment layout ignored a draw's writes or samples");
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 
@@ -47599,6 +47680,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--movrels-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1MoveRelSource());
+    RunCase(&vulkan, Vop1MoveRelSourceBoundedIndex());
+    RunCase(&vulkan, Vop1MoveRelSourceUnboundedIndex());
+    RunCase(&vulkan, Vop1MoveRelSourceIndexPastRegisters());
+    RunCase(&vulkan, Vop1MoveRelDestination());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {

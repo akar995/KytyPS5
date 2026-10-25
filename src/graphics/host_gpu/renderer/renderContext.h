@@ -11,10 +11,12 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/indirectMeshDraws.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -27,6 +29,7 @@ namespace Libs::Graphics {
 
 class GuestGpu;
 
+class GpuProfiler; // PERF-INSTR
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext& graphics);
@@ -47,12 +50,23 @@ public:
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	IndirectMeshDraws&  GetIndirectMeshDraws();
+	GpuProfiler*        GetGpuProfiler(); // PERF-INSTR
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// The whole mapped range containing [vaddr, vaddr + size), if any.
+	[[nodiscard]] bool FindMappedRange(uint64_t vaddr, uint64_t size, uint64_t& begin,
+	                                   uint64_t& end) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// Changes whenever a mapping changes or a page becomes read-protected, so values read from
+	// guest memory earlier hold while it is unchanged (apart from the CPU's own writes).
+	[[nodiscard]] uint64_t MemoryEpoch() const noexcept {
+		return m_map_generation.load(std::memory_order_acquire) +
+		       PageManager::ReadProtectGeneration();
+	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
@@ -78,13 +92,22 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	// Bumped on every unmap so threads can trust a cached mapped range until it changes.
+	std::atomic<uint64_t>     m_unmap_generation = 0;
+	// Bumped on every map and unmap; see MemoryEpoch.
+	std::atomic<uint64_t>     m_map_generation = 0;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	// Upload generation covered by the last PrepareBda pass.
+	uint64_t                  m_bda_upload_generation = UINT64_MAX;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
+	// Created on first use; destroyed before the caches and the scheduler.
+	std::unique_ptr<IndirectMeshDraws>   m_indirect_mesh_draws;
+	std::unique_ptr<GpuProfiler>         m_gpu_profiler; // PERF-INSTR
 };
 
 } // namespace Libs::Graphics

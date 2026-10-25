@@ -20,6 +20,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -157,6 +158,11 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	// Long select(index == constant, ...) chains (V_MOVRELS reads) become one OpSwitch at their
+	// outermost select; their inner selects emit nothing (see EmitIndexedSelect).
+	bool                                             indexed_selects_found = false;
+	std::unordered_set<const IR::Inst*>              indexed_select_heads;
+	std::unordered_set<const IR::Inst*>              indexed_select_members;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -415,6 +421,10 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+// LDS held in workgroup or function memory ends in one spare dword that takes out-of-range
+// accesses, so they need no branch around them.
+bool     LdsHasGuardSlot(const EmitterState& state);
+uint32_t LdsArrayDwords(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {

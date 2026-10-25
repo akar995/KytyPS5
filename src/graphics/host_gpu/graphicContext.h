@@ -34,8 +34,12 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	bool                               depth_color_copy_enabled               = false;
+	bool                               draw_indirect_first_instance_enabled  = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// Out-of-bounds storage-buffer loads read zero (VK_EXT_robustness2 robustBufferAccess2).
+	bool                                      robust_buffer_access2_enabled         = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -99,13 +103,37 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
-	void                   DeleteImage(VulkanImage& image);
+	// With `reuse`, an image deleted with `keep` that was created with the same parameters is
+	// taken instead of a new allocation. Its contents are undefined, as a new image's are; the
+	// callers pass both flags only for images whose contents are uploaded before any use.
+	// Transient render targets are re-created every frame, and each new one would otherwise
+	// make VMA allocate a whole memory block.
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                                   bool reuse = false);
+	void                   DeleteImage(VulkanImage& image, bool keep = false);
+	void                   ReleaseKeptImages();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	struct KeptImage {
+		vk::ImageCreateFlags flags;
+		vk::ImageType        type = vk::ImageType::e2D;
+		vk::Format           format = vk::Format::eUndefined;
+		vk::Extent3D         extent;
+		uint32_t             mip_levels = 1;
+		uint32_t             layers     = 1;
+		uint32_t             samples    = 1;
+		vk::ImageUsageFlags  usage;
+		vk::Image            image      = nullptr;
+		VmaAllocation        allocation = nullptr;
+		uint64_t             bytes      = 0;
+	};
+	std::mutex             m_kept_images_mutex;
+	std::vector<KeptImage> m_kept_images;
+	uint64_t               m_kept_bytes = 0;
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;

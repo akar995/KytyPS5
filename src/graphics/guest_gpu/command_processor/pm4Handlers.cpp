@@ -2249,16 +2249,15 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
+	// Interrupts are not flushed here: a submission is flushed whenever processing stops, so
+	// a guest wait on this event cannot stall the work that signals it.
 	auto trigger_interrupt = [&]() {
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
 			case 0x01:
 			case 0x02:
-			case 0x04:
-				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				cp.BufferFlush();
-				break;
+			case 0x04: cp.TriggerEopEventAtEndOfPipe(interrupt_context_id); break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
 	};
@@ -2298,9 +2297,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
-			cp.BufferFlush();
-		}
 
 		return 7;
 	}
@@ -2317,9 +2313,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01) {
-			cp.BufferFlush();
-		}
 
 		return 7;
 	}

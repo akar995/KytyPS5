@@ -176,6 +176,14 @@ uint32_t GetTrophyDurationSeconds() {
 	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
 }
 
+bool AsyncPipelinesEnabled() {
+	return g_config->async_pipelines_enabled;
+}
+
+bool RecordThreadEnabled() {
+	return g_config->record_thread_enabled;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

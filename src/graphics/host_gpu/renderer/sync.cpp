@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h" // PERF-INSTR
+#include "common/perfCounters.h" // PERF-INSTR
 
 #include "common/assert.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -51,6 +53,9 @@ uint64_t ReadReferenceClock() {
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+	if (auto* profiler = buffer.GetContext().GetGpuProfiler()) profiler->Frame(); // PERF-INSTR
+	Common::Perf::Add(Common::Perf::Presents); // PERF-INSTR
+	buffer.GetContext().GetTextureCache().TickFrame();
 	for (;;) {
 		uint64_t   request_id = 0;
 		auto&      video_out  = buffer.GetContext().GetVideoOut();

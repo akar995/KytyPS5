@@ -798,6 +798,12 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+	// BENCH-HOOK-BEGIN
+	const bool bench_secondary = std::getenv("KYTY_WINDOW_SECONDARY") != nullptr;
+	if (bench_secondary) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
+	// BENCH-HOOK-END
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {
@@ -805,6 +811,21 @@ static void WindowCreate(WindowContext& context) {
 	}
 
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	// BENCH-HOOK-BEGIN
+	if (bench_secondary) {
+		int   display_count = 0;
+		auto* displays      = SDL_GetDisplays(&display_count);
+		for (int i = 0; displays != nullptr && i < display_count; i++) {
+			if (displays[i] != SDL_GetPrimaryDisplay()) {
+				SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED_DISPLAY(displays[i]),
+				                      SDL_WINDOWPOS_CENTERED_DISPLAY(displays[i]));
+				break;
+			}
+		}
+		SDL_free(displays);
+		SDL_ShowWindow(context.window);
+	}
+	// BENCH-HOOK-END
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();

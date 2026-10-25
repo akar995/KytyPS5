@@ -94,6 +94,8 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
+	::printf("  --async-pipelines <true|false>       Build graphics pipelines in the background,\n"
+	         "                                       skipping draws until ready. Default: true.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
@@ -479,6 +481,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--async-pipelines") {
+			if (!ParseBool(value, options.config.async_pipelines_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
@@ -499,7 +506,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if defined(KYTY_PGO_GEN) // PERF-INSTR
+#include <chrono> // PERF-INSTR
+#include <thread> // PERF-INSTR
+extern "C" int __llvm_profile_write_file(void); // PERF-INSTR
+static void StartPgoDump() { // PERF-INSTR
+	const char* seconds = std::getenv("KYTY_PGO_DUMP_SECONDS"); // PERF-INSTR
+	if (seconds == nullptr) return; // PERF-INSTR
+	std::thread([s = std::atoi(seconds)] { // PERF-INSTR
+		std::this_thread::sleep_for(std::chrono::seconds(s)); // PERF-INSTR
+		__llvm_profile_write_file(); // PERF-INSTR
+		std::fprintf(stderr, "PGO profile written\n"); // PERF-INSTR
+	}).detach(); // PERF-INSTR
+} // PERF-INSTR
+#else // PERF-INSTR
+static void StartPgoDump() {} // PERF-INSTR
+#endif // PERF-INSTR
 static int Main(int argc, char* argv[]) {
+	StartPgoDump(); // PERF-INSTR
 	VirtualMemory::Init();
 	InitializeThreads();
 

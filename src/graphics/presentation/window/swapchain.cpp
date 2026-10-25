@@ -15,6 +15,9 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 
+#include <chrono> // BENCH-HOOK-BEGIN // BENCH-HOOK-END
+#include <cstdio> // BENCH-HOOK-BEGIN // BENCH-HOOK-END
+#include <cstdlib> // BENCH-HOOK-BEGIN // BENCH-HOOK-END
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1058,6 +1061,21 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		// BENCH-HOOK-BEGIN
+		if (static FILE* frame_log = [] {
+			    const char* path = std::getenv("KYTY_FRAME_LOG");
+			    return path != nullptr ? std::fopen(path, "w") : nullptr;
+		    }();
+		    frame_log != nullptr) {
+			static uint64_t logged = 0;
+			std::fprintf(frame_log, "%lld\n",
+			             static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                 std::chrono::steady_clock::now().time_since_epoch()).count()));
+			if ((++logged & 63u) == 0) {
+				std::fflush(frame_log);
+			}
+		}
+		// BENCH-HOOK-END
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

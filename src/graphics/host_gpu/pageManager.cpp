@@ -90,6 +90,8 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+std::atomic<uint64_t> g_read_protect_generation {0};
+
 } // namespace
 
 struct PageManager::Impl {
@@ -212,6 +214,11 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
+		if constexpr (track && is_read) {
+			// Before any page loses read access, so a reader that sees the old value read it
+			// while the page was still readable.
+			g_read_protect_generation.fetch_add(1, std::memory_order_acq_rel);
+		}
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -292,6 +299,10 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+uint64_t PageManager::ReadProtectGeneration() noexcept {
+	return g_read_protect_generation.load(std::memory_order_acquire);
 }
 
 template <bool track>

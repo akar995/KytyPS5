@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
@@ -11,12 +12,14 @@
 // macOS has no clock_nanosleep.
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
 #define KYTY_POSIX_HIGH_RES_SLEEP
+#include <cstdlib>
 #include <ctime>
 #endif
 
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -233,6 +236,93 @@ void Thread::SleepNano(uint64_t nanos) {
 
 bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
+}
+
+#ifdef KYTY_WIN_CS
+namespace {
+
+// Physical cores set aside for DedicateCore, as CPU-set ids of their logical processors.
+std::vector<std::vector<ULONG>> ReserveDedicatedCores() {
+	// The GPU thread, the resource helper and the draw lookahead workers.
+	const char* workers = std::getenv("KYTY_LOOKAHEAD_WORKERS");
+	const size_t wanted = 2u + (workers != nullptr ? std::strtoul(workers, nullptr, 10)
+	                                               : Thread::LookaheadWorkerCount);
+	ULONG            length = 0;
+	GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 ||
+	    !GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+	                                length, &length, GetCurrentProcess(), 0)) {
+		return {};
+	}
+	struct Core {
+		uint32_t           key = 0; // efficiency class, then core index
+		std::vector<ULONG> ids;
+	};
+	std::vector<Core> cores;
+	std::vector<ULONG> all;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + offset);
+		offset += info->Size;
+		if (info->Type != CpuSetInformation) {
+			continue;
+		}
+		const auto& set = info->CpuSet;
+		all.push_back(set.Id);
+		const uint32_t key = (static_cast<uint32_t>(set.Group) << 24u) |
+		                     (static_cast<uint32_t>(set.EfficiencyClass) << 16u) | set.CoreIndex;
+		auto core = std::ranges::find(cores, key, &Core::key);
+		if (core == cores.end()) {
+			core = cores.insert(cores.end(), Core {key, {}});
+		}
+		core->ids.push_back(set.Id);
+	}
+	// Leave a core for everything else, and keep core 0, which takes most interrupts.
+	if (cores.size() < 8) {
+		return {};
+	}
+	std::ranges::sort(cores, [](const Core& a, const Core& b) {
+		const auto efficiency = [](uint32_t key) { return (key >> 16u) & 0xffu; };
+		return efficiency(a.key) != efficiency(b.key) ? efficiency(a.key) > efficiency(b.key)
+		                                              : a.key > b.key;
+	});
+	std::vector<std::vector<ULONG>> reserved;
+	const size_t Cores = std::min(wanted, cores.size() / 2);
+	for (size_t i = 0; i < Cores; i++) {
+		reserved.push_back(cores[i].ids);
+	}
+	std::vector<ULONG> rest;
+	for (const auto id: all) {
+		if (std::ranges::none_of(reserved, [&](const auto& ids) {
+			    return std::ranges::find(ids, id) != ids.end();
+		    })) {
+			rest.push_back(id);
+		}
+	}
+	if (!SetProcessDefaultCpuSets(GetCurrentProcess(), rest.data(),
+	                              static_cast<ULONG>(rest.size()))) {
+		return {};
+	}
+	return reserved;
+}
+
+} // namespace
+#endif
+
+void Thread::DedicateCore(uint32_t slot) {
+	// With few cores the guest threads need every one of them.
+	if (std::thread::hardware_concurrency() < 16) {
+		return;
+	}
+#ifdef KYTY_WIN_CS
+	static const auto reserved = ReserveDedicatedCores();
+	if (slot < reserved.size()) {
+		SetThreadSelectedCpuSets(GetCurrentThread(), reserved[slot].data(),
+		                         static_cast<ULONG>(reserved[slot].size()));
+	}
+#else
+	(void)slot;
+#endif
 }
 
 std::string Thread::GetId() const {

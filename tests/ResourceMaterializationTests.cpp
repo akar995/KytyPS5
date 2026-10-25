@@ -689,7 +689,7 @@ void TestSharedControlPredicates() {
             "shared predicate changed its uniform factor or cached runtime values");
       std::vector<uint32_t> flat;
       Check(walker.RefreshFlatBuffer(flat) &&
-                plan.visited_blocks == (known
+                SrtWalker::VisitedBlocks(plan) == (known
                     ? (conjunction ? std::vector<uint8_t>{1, 1, 0, 1}
                                    : std::vector<uint8_t>{1, 0, 1, 0})
                     : std::vector<uint8_t>{1, 1, 1, 1}),
@@ -1020,7 +1020,7 @@ void TestCyclicControlPredicatesRemainUnknown() {
             !walker.Evaluate(plan.control_flow[2].condition, value),
         "cyclic varying control acquired an unsupported uniform value");
   std::vector<uint32_t> flat;
-  Check(walker.RefreshFlatBuffer(flat) && plan.visited_blocks == std::vector<uint8_t>({1, 1, 1, 1}),
+  Check(walker.RefreshFlatBuffer(flat) && SrtWalker::VisitedBlocks(plan) == std::vector<uint8_t>({1, 1, 1, 1}),
         "cyclic control lost a possible branch during reachability");
 }
 

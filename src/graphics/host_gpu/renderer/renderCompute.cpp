@@ -16,6 +16,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h" // PERF-INSTR
+#include "common/perfCounters.h" // PERF-INSTR
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -181,7 +183,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		return cache.FillColorMetadata(descriptor.Base48(), size, packed_clear);
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -224,6 +226,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	Common::Perf::ScopedTimer perf_dispatch_timer(Common::Perf::DispatchNs); // PERF-INSTR
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -293,8 +296,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, sh_regs, input_info, m_context.MemoryEpoch(), m_draw_record);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -430,7 +433,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (auto* profiler = m_context.GetGpuProfiler()) profiler->Mark(vk_buffer, GpuProfiler::Kind::Before); // PERF-INSTR
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (auto* profiler = m_context.GetGpuProfiler()) profiler->Mark(vk_buffer, GpuProfiler::Kind::Dispatch, program.shader_hash, 0, thread_group_x * thread_group_y * thread_group_z); // PERF-INSTR
+	Common::Perf::Add(Common::Perf::Dispatches); // PERF-INSTR
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -439,6 +445,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	Common::Perf::ScopedTimer perf_dispatch_timer(Common::Perf::DispatchNs); // PERF-INSTR
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -460,7 +467,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_context.MemoryEpoch(),
+	    m_draw_record);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -499,7 +507,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (auto* profiler = m_context.GetGpuProfiler()) profiler->Mark(vk_buffer, GpuProfiler::Kind::Before); // PERF-INSTR
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (auto* profiler = m_context.GetGpuProfiler()) profiler->Mark(vk_buffer, GpuProfiler::Kind::Dispatch, program.shader_hash, 1, 0); // PERF-INSTR
+	Common::Perf::Add(Common::Perf::Dispatches); // PERF-INSTR
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

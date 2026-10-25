@@ -6,12 +6,15 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <type_traits>
@@ -50,11 +53,25 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// direct: set when an existing image matched desc without an overlap, insertion or
+	// replacement; for an equal desc that result holds until the image set changes.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      bool* direct = nullptr);
+	// Advances whenever an image is registered or unregistered.
+	[[nodiscard]] uint64_t      ImageSetEpoch() const noexcept { return m_image_set_epoch; }
+	// Whether no image whose data overlaps range was registered or unregistered after epoch, so
+	// a lookup of that range would see the same candidates.
+	[[nodiscard]] bool          ImageSetUnchanged(uint64_t epoch, GuestRange range) const noexcept;
+	// For a desc equal to one whose FindImage matched id directly, with no image overlapping its
+	// data registered or unregistered since: runs only the per-use part of that lookup.
+	ImageId                     RefindImage(ImageId id, const ImageDesc& desc);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// For a sampled texture FindTexture returned a view of before: true when nothing FindTexture
+	// checks can have changed since, so that view still applies. Touches the image like it.
+	[[nodiscard]] bool RefindTexture(ImageId id, BindingType type);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -66,6 +83,8 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// Applies a uniform compute fill of known color metadata to guest memory instead of the GPU.
+	[[nodiscard]] bool FillColorMetadata(uint64_t address, uint64_t size, uint32_t packed_fill);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
@@ -78,6 +97,8 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Called once per presented frame; overlapped images age in frames.
+	void TickFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 
 private:
 	struct MetaDataInfo {
@@ -176,13 +197,39 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Entries added to m_surface_metas so far (GPU thread).
+	uint64_t                                          m_surface_meta_inserts = 0;
+	// DCC/CMASK ranges of color targets seen by MaterializeColorClear.
+	RangeSet                                          m_color_metadata;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	std::atomic<uint64_t> m_frame {0};
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	uint64_t         m_image_set_epoch        = 1;
+	// Advances when memory inside m_color_metadata may have changed: guest writes, GPU writes,
+	// unmaps and the clears' own expansion. MaterializeColorClear memoizes per generation.
+	std::atomic<uint64_t> m_metadata_generation {1};
+	// Data ranges of the latest image set changes, by epoch.
+	static constexpr size_t                    ImageSetHistory = 64;
+	std::array<GuestRange, ImageSetHistory>    m_image_set_changes {};
+	// FindImagesInRegion answers; registering or unregistering any image clears them.
+	struct RegionQuery {
+		uint64_t address      = 0;
+		uint64_t size         = 0;
+		bool     page_overlap = false;
+		bool     operator==(const RegionQuery&) const = default;
+	};
+	struct RegionQueryHash {
+		size_t operator()(const RegionQuery& query) const noexcept {
+			return std::hash<uint64_t>()(query.address ^ (query.size << 20u) ^
+			                             static_cast<uint64_t>(query.page_overlap));
+		}
+	};
+	mutable std::unordered_map<RegionQuery, std::vector<ImageId>, RegionQueryHash> m_region_queries;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

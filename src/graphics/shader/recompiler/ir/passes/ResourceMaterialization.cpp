@@ -530,8 +530,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto& sources = indirect.sources;
 	const auto* selector = indirect.selector ? &*indirect.selector : nullptr;
 	auto* selector_keys = selector != nullptr
-	    ? &program.selector_keys[program.selector_groups[source_index]] : nullptr;
-	auto& keys = selector_keys != nullptr ? selector_keys->values : program.material_keys;
+	    ? &SrtWalker::SelectorKeys(program)[program.selector_groups[source_index]] : nullptr;
+	auto& keys = selector_keys != nullptr ? selector_keys->values : SrtWalker::MaterialKeys(program);
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
 	const auto intern_candidate = [&](const DescriptorValue& candidate, uint32_t& ordinal) {
@@ -1469,13 +1469,19 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	// Walks on several threads must not assign evaluation indices: assign them all here.
+	for (const auto& inst: plan.value_storage) {
+		(void)inst.EvaluationIndex(plan.evaluation_value_count);
+	}
 	CompileSrtWalker(plan);
 	return plan;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	for (auto& keys: program.selector_keys) keys.resolved = false;
+	auto& selector_keys = SrtWalker::SelectorKeys(program);
+	selector_keys.resize(program.selector_keys.size());
+	for (auto& keys: selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
@@ -1489,8 +1495,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
+	snapshot.read_runs_valid = false;
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	if (capture_reads) {
+		observed.captured_reads = &reads;
+	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
@@ -1498,7 +1508,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
-	const auto active = std::span<const uint8_t>(program.active_sources);
+	const auto active = std::span<const uint8_t>(SrtWalker::ActiveSources(program));
 	std::array<uint32_t, 3> workgroup_counts {};
 	if (runtime.indirect_args_address != 0u) {
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
@@ -1672,6 +1682,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	// Draws check these reads against their writes; merging them here keeps that off the GPU
+	// thread when a helper materializes.
+	snapshot.read_runs_valid =
+	    MergeReadRuns(reads, snapshot.read_runs, snapshot.read_begin, snapshot.read_end);
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 

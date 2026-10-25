@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -162,6 +163,26 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
+bool LdsHasGuardSlot(const EmitterState& state) {
+	if (state.lds_storage_class == spv::StorageClassFunction) {
+		return true;
+	}
+	// Buffer-backed LDS packs the workgroups' regions next to each other.
+	if (state.lds_storage_class != spv::StorageClassWorkgroup) {
+		return false;
+	}
+	// The spare dword must fit the workgroup memory limit, with room for the few other workgroup
+	// variables a module declares.
+	constexpr uint64_t OtherWorkgroupBytes = 256;
+	const auto limit = state.program.stage == ShaderType::Mesh ? MeshSharedMemoryLimit()
+	                                                           : ComputeSharedMemoryLimit();
+	return (uint64_t {LdsDwordCount(state)} + 1u) * 4u + OtherWorkgroupBytes <= limit;
+}
+
+uint32_t LdsArrayDwords(const EmitterState& state) {
+	return LdsDwordCount(state) + (LdsHasGuardSlot(state) ? 1u : 0u);
+}
+
 void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
@@ -169,10 +190,10 @@ void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_storage_class != spv::StorageClassWorkgroup) {
 		EXIT("LDS backing was not prepared before SPIR-V function emission\n");
 	}
-	const auto define = [&](uint32_t type, uint32_t bytes) {
+	const auto define = [&](uint32_t type, uint32_t bytes, uint32_t dwords) {
 		const auto array = state.builder.DecoratedType(
 		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,
-		    ConstantU32(state, std::max(LdsDwordCount(state) * 4u / bytes, 1u)));
+		    ConstantU32(state, std::max(dwords * 4u / bytes, 1u)));
 		const auto block = state.builder.DecoratedType(
 		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
 		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
@@ -182,12 +203,12 @@ void EnsureLdsStorage(EmitterState& state) {
 		return variable;
 	};
 	if (state.program.info.shared_int64_atomics) {
-		state.lds_variable = define(TypeU32(state), 4u);
-		state.lds_u64_variable = define(TypeU64(state), 8u);
+		state.lds_variable = define(TypeU32(state), 4u, LdsArrayDwords(state));
+		state.lds_u64_variable = define(TypeU64(state), 8u, LdsDwordCount(state));
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
-		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsArrayDwords(state)),
 		    spv::StorageClassWorkgroup);
 	}
 	state.builder.AddName(state.lds_variable, "lds_dwords");

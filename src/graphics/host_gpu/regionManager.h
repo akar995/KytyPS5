@@ -92,10 +92,23 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// Readable without the lock: false means no page holds GPU-modified data. It changes only
+	// under the lock, so a reader that sees false is ordered as if it had locked first.
+	[[nodiscard]] bool MayHaveGpuModified() const noexcept {
+		return m_gpu_dirty_any.load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		return GetBits<source>().FirstRangeFrom(start).first < end;
+	}
+
+	// End of the run of pages from vaddr's page that hold no GPU-modified data, or vaddr when
+	// its own page does.
+	[[nodiscard]] uint64_t GpuCleanEnd(uint64_t vaddr) const {
+		const auto page  = static_cast<size_t>((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
+		const auto dirty = m_gpu_dirty.FirstRangeFrom(page).first;
+		return dirty == page ? vaddr : m_cpu_addr + dirty * TRACKER_PAGE_SIZE;
 	}
 
 	template <DirtySource source, bool enable>
@@ -124,6 +137,19 @@ public:
 		}
 	}
 
+	// Marks vaddr's page CPU-modified together with the pages of its aligned fault block that
+	// hold no GPU-modified data. The caller has checked that vaddr's own page holds none.
+	void ChangeCpuStateForFault(uint64_t vaddr) {
+		const auto page  = GetPageRange(vaddr, 1).first;
+		const auto first = page - page % TRACKER_FAULT_BLOCK_PAGES;
+		for (auto index = first; index < first + TRACKER_FAULT_BLOCK_PAGES; index++) {
+			if (!m_gpu_dirty.Get(index)) {
+				m_cpu_dirty.Set(index);
+			}
+		}
+		UpdateProtection<false, false>();
+	}
+
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -150,6 +176,9 @@ public:
 private:
 	template <bool track, bool is_read>
 	void UpdateProtection() {
+		if constexpr (is_read) {
+			m_gpu_dirty_any.store(m_gpu_dirty.Any(), std::memory_order_release);
+		}
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
@@ -194,6 +223,8 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// Whether m_gpu_dirty has any page set; see MayHaveGpuModified.
+	std::atomic_bool m_gpu_dirty_any {false};
 };
 
 } // namespace Libs::Graphics

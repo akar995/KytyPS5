@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h" // PERF-INSTR
+#include "common/perfCounters.h" // PERF-INSTR
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -7,6 +9,10 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic> // PERF-INSTR
+#include <cstdio> // PERF-INSTR
+#include <cstdlib> // PERF-INSTR
+#include <windows.h> // PERF-INSTR
 
 namespace Libs::Graphics {
 
@@ -17,6 +23,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_command_scheduler.EnableAsyncSubmit();
+	Common::Perf::StartReporter(); // PERF-INSTR
 }
 
 RenderContext::~RenderContext() {
@@ -54,6 +62,19 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+IndirectMeshDraws& RenderContext::GetIndirectMeshDraws() {
+	if (m_indirect_mesh_draws == nullptr) {
+		m_indirect_mesh_draws = std::make_unique<IndirectMeshDraws>(m_graphics, m_command_scheduler);
+	}
+	return *m_indirect_mesh_draws;
+}
+
+GpuProfiler* RenderContext::GetGpuProfiler() { // PERF-INSTR
+	if (!GpuProfiler::Enabled()) return nullptr; // PERF-INSTR
+	if (m_gpu_profiler == nullptr) m_gpu_profiler = std::make_unique<GpuProfiler>(m_graphics, m_command_scheduler); // PERF-INSTR
+	return m_gpu_profiler.get(); // PERF-INSTR
+} // PERF-INSTR
+ // PERF-INSTR
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -62,9 +83,19 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.InvalidateWriteFault(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		if (static const bool log = std::getenv("KYTY_LOG_READ_FAULT_STACKS") != nullptr; log) { // PERF-INSTR
+			static std::atomic<int> logged {0}; // PERF-INSTR
+			if (logged.fetch_add(1) < 12) { // PERF-INSTR
+				void* frames[24] {}; // PERF-INSTR
+				const auto count = RtlCaptureStackBackTrace(0, 24, frames, nullptr); // PERF-INSTR
+				std::fprintf(stderr, "READ-FAULT addr=%llx gpu_thread=%d stack:", (unsigned long long)fault_vaddr, GuestGpu::IsGpuThread() ? 1 : 0); // PERF-INSTR
+				for (USHORT f = 0; f < count; f++) std::fprintf(stderr, " %p", frames[f]); // PERF-INSTR
+				std::fprintf(stderr, " base=%p\n", (void*)GetModuleHandleW(nullptr)); // PERF-INSTR
+			} // PERF-INSTR
+		} // PERF-INSTR
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -83,13 +114,42 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
+	// Shader resource evaluation asks for many small reads inside the same mapping.
+	struct Cached {
+		const RenderContext* owner      = nullptr;
+		uint64_t             begin      = 0;
+		uint64_t             end        = 0;
+		uint64_t             generation = 0;
+	};
+	thread_local Cached cached;
+	if (cached.owner == this && vaddr >= cached.begin && vaddr < cached.end &&
+	    size <= cached.end - vaddr &&
+	    cached.generation == m_unmap_generation.load(std::memory_order_acquire)) {
+		return true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	return m_mapped_ranges.Contains(vaddr, size);
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	if (!m_mapped_ranges.FindContaining(vaddr, size, begin, end)) {
+		return false;
+	}
+	cached = {this, begin, end, m_unmap_generation.load(std::memory_order_relaxed)};
+	return true;
+}
+
+bool RenderContext::FindMappedRange(uint64_t vaddr, uint64_t size, uint64_t& begin,
+                                    uint64_t& end) const noexcept {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.FindContaining(vaddr, size, begin, end);
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_map_generation.fetch_add(1, std::memory_order_release);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -113,6 +173,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_unmap_generation.fetch_add(1, std::memory_order_release);
+		m_map_generation.fetch_add(1, std::memory_order_release);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -128,10 +190,15 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Shaders may reach any buffer through BDA, so every buffer is brought up to date. A pass
+	// leaves all of them clean; another is needed only once something became CPU-dirty or a
+	// buffer was created, and then only over the ranges where that happened.
+	const auto generation = m_buffer_cache.UploadGeneration();
+	if (generation != m_bda_upload_generation) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_buffer_cache.SynchronizeDirtyBuffers(m_mapped_ranges);
+		m_bda_upload_generation = generation;
+	}
 	m_fault_process_pending = true;
 }
 

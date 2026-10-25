@@ -16,6 +16,12 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+// BENCH-HOOK-BEGIN
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+// BENCH-HOOK-END
 
 namespace Libs::Graphics {
 
@@ -705,6 +711,112 @@ int PollGamepadTouchPad(uint64_t now_ms) {
 	return GAMEPAD_TOUCHPAD_POLL_MS;
 }
 
+// BENCH-HOOK-BEGIN
+constexpr std::size_t SHAKE_CONTROL = INVALID_CONTROL + 1;
+constexpr std::size_t AXIS_CONTROL  = INVALID_CONTROL + 100;
+
+void StartInputScript() {
+#if defined(SDL_GetGamepadFromID)
+	// HostInputTests includes this file with faked SDL and controller calls.
+	return;
+#else
+	const char* script = std::getenv("KYTY_INPUT_SCRIPT");
+	if (script == nullptr || *script == '\0') {
+		return;
+	}
+	struct Event {
+		uint64_t    time;
+		std::size_t control;
+		bool        down;
+	};
+	std::vector<Event> events;
+	std::string_view   rest = script;
+	while (!rest.empty()) {
+		const auto end   = rest.find(';');
+		const auto entry = rest.substr(0, end);
+		rest             = end == std::string_view::npos ? std::string_view {} : rest.substr(end + 1);
+		const auto first = entry.find(':');
+		if (first == std::string_view::npos) {
+			continue;
+		}
+		const auto second  = entry.find(':', first + 1);
+		const auto name    = entry.substr(first + 1, second == std::string_view::npos
+		                                                     ? std::string_view::npos
+		                                                     : second - first - 1);
+		const auto time    = std::strtoull(std::string(entry.substr(0, first)).c_str(), nullptr, 10);
+		const auto hold    = second == std::string_view::npos
+		                         ? 150ull
+		                         : std::strtoull(std::string(entry.substr(second + 1)).c_str(),
+		                                         nullptr, 10);
+		std::size_t control = name == "Shake" ? SHAKE_CONTROL : ControlFromName(name);
+		// LX<value> / LY<value>: hold the left stick axis at an exact value.
+		if (control == INVALID_CONTROL && name.size() > 2 && name[0] == 'L' &&
+		    (name[1] == 'X' || name[1] == 'Y')) {
+			const auto value = std::strtoul(std::string(name.substr(2)).c_str(), nullptr, 10);
+			control          = AXIS_CONTROL + (name[1] == 'Y' ? 1000u : 0u) + value;
+		}
+		if (control == INVALID_CONTROL) {
+			continue;
+		}
+		events.push_back({time, control, true});
+		events.push_back({time + hold, control, false});
+	}
+	std::ranges::stable_sort(events, {}, &Event::time);
+	std::thread([events = std::move(events)] {
+		const auto start = std::chrono::steady_clock::now();
+		static std::atomic_bool shaking {false};
+		for (const auto& event: events) {
+			std::this_thread::sleep_until(start + std::chrono::milliseconds(event.time));
+			if (event.control >= AXIS_CONTROL) {
+				const auto code = event.control - AXIS_CONTROL;
+				const auto axis = code >= 1000u ? Controller::Axis::LeftY : Controller::Axis::LeftX;
+				Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis,
+				                    event.down ? static_cast<int>(code % 1000u) : 128);
+				continue;
+			}
+			if (event.control == SHAKE_CONTROL) {
+				if (event.down && !shaking.exchange(true)) {
+					std::thread([] {
+						const auto begin = std::chrono::steady_clock::now();
+						while (shaking.load()) {
+							const auto now = std::chrono::steady_clock::now();
+							const float t  = std::chrono::duration<float>(now - begin).count();
+							const auto us  = static_cast<uint64_t>(
+							    std::chrono::duration_cast<std::chrono::microseconds>(
+							        now.time_since_epoch()).count());
+							const float accel[3] = {9.8f * 1.5f * std::sin(t * 30.0f),
+							                        9.8f * (1.0f + 1.5f * std::cos(t * 30.0f)),
+							                        9.8f * 0.8f * std::sin(t * 23.0f)};
+							const float gyro[3]  = {6.0f * std::cos(t * 30.0f),
+							                        4.0f * std::sin(t * 27.0f),
+							                        5.0f * std::cos(t * 23.0f)};
+							const int id = Controller::GetActiveControllerId();
+							Controller::SetSensor(id, Controller::Sensor::Accel, accel, us);
+							Controller::SetSensor(id, Controller::Sensor::Gyro, gyro, us);
+							std::this_thread::sleep_for(std::chrono::milliseconds(4));
+						}
+						// Back to a controller lying still.
+						const auto us = static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::microseconds>(
+						        std::chrono::steady_clock::now().time_since_epoch()).count());
+						const float rest_accel[3] = {0.0f, 9.8f, 0.0f};
+						const float rest_gyro[3]  = {0.0f, 0.0f, 0.0f};
+						const int   id            = Controller::GetActiveControllerId();
+						Controller::SetSensor(id, Controller::Sensor::Accel, rest_accel, us);
+						Controller::SetSensor(id, Controller::Sensor::Gyro, rest_gyro, us);
+					}).detach();
+				} else if (!event.down) {
+					shaking = false;
+				}
+				continue;
+			}
+			SetControl(event.control, event.down);
+		}
+	}).detach();
+#endif
+}
+// BENCH-HOOK-END
+
 } // namespace
 
 void HostInputPadButton(int id, int button, bool down) {
@@ -741,6 +853,7 @@ void HostInputDisconnectGamepad(int id) {
 
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
+	StartInputScript(); // BENCH-HOOK-BEGIN // BENCH-HOOK-END
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;

@@ -56,6 +56,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	ReleaseKeptImages();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -128,21 +129,43 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                 bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	if (reuse && image_info.pNext == nullptr && image_info.tiling == vk::ImageTiling::eOptimal &&
+	    image_info.sharingMode == vk::SharingMode::eExclusive &&
+	    image_info.initialLayout == vk::ImageLayout::eUndefined) {
+		std::scoped_lock lock(m_kept_images_mutex);
+		const auto       kept = std::ranges::find_if(m_kept_images, [&](const KeptImage& entry) {
+			return entry.flags == image_info.flags && entry.type == image_info.imageType &&
+			       entry.format == image_info.format && entry.extent == image_info.extent &&
+			       entry.mip_levels == image_info.mipLevels &&
+			       entry.layers == image_info.arrayLayers &&
+			       entry.samples == static_cast<uint32_t>(image_info.samples) &&
+			       entry.usage == image_info.usage;
+		});
+		if (kept != m_kept_images.end()) {
+			image.image      = kept->image;
+			image.allocation = kept->allocation;
+			m_kept_bytes -= kept->bytes;
+			m_kept_images.erase(kept);
+		}
+	}
+	if (image.image == nullptr) {
+		VmaAllocationCreateInfo alloc_info {};
+		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto       result       = static_cast<vk::Result>(vmaCreateImage(
+		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		    &native_image, &image.allocation, nullptr));
+		image.image = native_image;
+		if (result != vk::Result::eSuccess) {
+			LogMemoryBudget();
+			return false;
+		}
 	}
 
 	image.format     = image_info.format;
@@ -159,13 +182,49 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	return true;
 }
 
-void GraphicContext::DeleteImage(VulkanImage& image) {
+void GraphicContext::DeleteImage(VulkanImage& image, bool keep) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	// Bounds the memory held by kept images; the oldest are destroyed first.
+	constexpr uint64_t KeptBytesLimit = 384ull * 1024 * 1024;
+	constexpr size_t   KeptCountLimit = 64;
+	if (keep) {
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		std::scoped_lock lock(m_kept_images_mutex);
+		m_kept_images.push_back({.flags      = image.flags,
+		                         .type       = image.image_type,
+		                         .format     = image.format,
+		                         .extent     = image.extent,
+		                         .mip_levels = image.mip_levels,
+		                         .layers     = image.layers,
+		                         .samples    = image.samples,
+		                         .usage      = image.usage,
+		                         .image      = image.image,
+		                         .allocation = image.allocation,
+		                         .bytes      = allocation_info.size});
+		m_kept_bytes += allocation_info.size;
+		while (m_kept_bytes > KeptBytesLimit || m_kept_images.size() > KeptCountLimit) {
+			const auto& oldest = m_kept_images.front();
+			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+			m_kept_bytes -= oldest.bytes;
+			m_kept_images.erase(m_kept_images.begin());
+		}
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
+}
+
+void GraphicContext::ReleaseKeptImages() {
+	std::scoped_lock lock(m_kept_images_mutex);
+	for (const auto& kept: m_kept_images) {
+		vmaDestroyImage(allocator, kept.image, kept.allocation);
+	}
+	m_kept_images.clear();
+	m_kept_bytes = 0;
 }
 
 } // namespace Libs::Graphics

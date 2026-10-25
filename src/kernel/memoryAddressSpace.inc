@@ -57,6 +57,18 @@ static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, 
 	}
 }
 
+class GuestBackingStore;
+
+// The backing mapping this thread read last (GuestBackingStore::TryReadCachedBacking).
+struct BackingReadCache {
+	const GuestBackingStore* owner          = nullptr;
+	uint64_t                 vaddr          = 0;
+	uint64_t                 size           = 0;
+	uint64_t                 backing_offset = 0;
+	uint64_t                 sequence       = 0;
+};
+static thread_local BackingReadCache t_read_cache;
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -190,7 +202,7 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		EditLock        lock(*this);
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -200,7 +212,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		EditLock        lock(*this);
 		const auto      end   = vaddr + size;
 		auto            first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
@@ -233,9 +245,32 @@ public:
 		return true;
 	}
 
+	// Copies a range inside the mapping this thread read last, without the lock, while no edit
+	// has happened since. False when the range is elsewhere or the copy overlapped an edit.
+	bool TryReadCachedBacking(uint64_t vaddr, void* data, uint64_t size) {
+		auto&      cached   = t_read_cache;
+		const auto sequence = m_edit_sequence.load(std::memory_order_acquire);
+		if (cached.owner != this || cached.sequence != sequence || vaddr < cached.vaddr ||
+		    vaddr - cached.vaddr >= cached.size || size > cached.size - (vaddr - cached.vaddr)) {
+			return false;
+		}
+		std::memcpy(data, m_backing_base + cached.backing_offset + (vaddr - cached.vaddr), size);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return m_edit_sequence.load(std::memory_order_relaxed) == sequence;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
+		}
+
+		// Resource evaluation reads many DWORDs from the same mapping: remember it, and copy
+		// without the lock while no edit has happened since. A copy that overlapped an edit
+		// sees the sequence move and repeats under the lock.
+		auto& cached      = t_read_cache;
+		auto* destination = static_cast<uint8_t*>(data);
+		if (TryReadCachedBacking(vaddr, data, size)) {
+			return true;
 		}
 
 		std::shared_lock lock(m_mutex);
@@ -264,7 +299,6 @@ public:
 			current += bytes;
 		}
 
-		auto* destination = static_cast<uint8_t*>(data);
 		current = vaddr;
 		for (auto mapping = first; current < end; ++mapping) {
 			const auto& entry  = mapping->second;
@@ -272,6 +306,11 @@ public:
 			const auto  offset = entry.backing_offset + current - entry.vaddr;
 			std::memcpy(destination + (current - vaddr), m_backing_base + offset, bytes);
 			current += bytes;
+		}
+		const auto& entry = first->second;
+		if (end <= entry.vaddr + entry.size) {
+			cached = {this, entry.vaddr, entry.size, entry.backing_offset,
+			          m_edit_sequence.load(std::memory_order_relaxed)};
 		}
 		return true;
 	}
@@ -293,6 +332,14 @@ public:
 			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
 		                },
 		                gap);
+		// A range inside one mapping has no gaps: later copies from it take the cached path.
+		if (auto entry = m_maps.upper_bound(vaddr); entry != m_maps.begin()) {
+			const auto& map = std::prev(entry)->second;
+			if (vaddr >= map.vaddr && vaddr + size <= map.vaddr + map.size) {
+				t_read_cache = {this, map.vaddr, map.size, map.backing_offset,
+				                m_edit_sequence.load(std::memory_order_relaxed)};
+			}
+		}
 		return true;
 	}
 
@@ -315,13 +362,13 @@ public:
 		}
 
 		{
-			std::lock_guard lock(m_mutex);
+			EditLock        lock(*this);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
-		std::lock_guard lock(m_mutex);
+		EditLock        lock(*this);
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
@@ -345,7 +392,7 @@ public:
 		const auto            end = vaddr + size;
 		std::vector<MapEntry> targets;
 		{
-			std::lock_guard lock(m_mutex);
+			EditLock        lock(*this);
 			auto            current = vaddr;
 			while (current < end) {
 				MapEntry entry {};
@@ -407,7 +454,7 @@ public:
 
 		MapEntry old {};
 		{
-			std::lock_guard lock(m_mutex);
+			EditLock        lock(*this);
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
 				auto entry = std::prev(next);
@@ -433,7 +480,7 @@ public:
 			const bool unmapped =
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
-				std::lock_guard lock(m_mutex);
+				EditLock        lock(*this);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -477,7 +524,7 @@ public:
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		EditLock        lock(*this);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -487,7 +534,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		EditLock        lock(*this);
 		RemoveMappingsUnlocked(vaddr, size);
 
 		if (placeholder_preserved != nullptr) {
@@ -522,6 +569,22 @@ public:
 	}
 
 private:
+	// Holds m_mutex exclusively for an edit of the mappings or the backing bytes. The edit
+	// sequence is odd meanwhile and moves on afterwards, so a lock-free reader can tell
+	// whether its copy overlapped or followed an edit.
+	class EditLock final {
+	public:
+		explicit EditLock(GuestBackingStore& store): m_store(store), m_lock(store.m_mutex) {
+			m_store.m_edit_sequence.fetch_add(1, std::memory_order_acq_rel);
+		}
+		~EditLock() { m_store.m_edit_sequence.fetch_add(1, std::memory_order_release); }
+		KYTY_CLASS_NO_COPY(EditLock);
+
+	private:
+		GuestBackingStore&                 m_store;
+		std::lock_guard<std::shared_mutex> m_lock;
+	};
+
 	struct MapEntry {
 		uint64_t            vaddr          = 0;
 		uint64_t            size           = 0;
@@ -689,6 +752,7 @@ private:
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
+	std::atomic<uint64_t>        m_edit_sequence {0};
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
@@ -785,6 +849,12 @@ public:
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
+		// A range inside the backing mapping this thread read last is owned and has no gaps or
+		// private mappings: copy it without the locks.
+		if (data != nullptr && size != 0 && UINT64_MAX - vaddr >= size &&
+		    m_backing->TryReadCachedBacking(vaddr, data, size)) {
+			return true;
+		}
 		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}

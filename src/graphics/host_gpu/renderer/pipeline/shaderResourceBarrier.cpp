@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h" // PERF-INSTR
 
 #include "common/assert.h"
 #include "graphics/shader/shader.h"
@@ -51,6 +52,7 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
+	                        vk::AccessFlagBits::eIndirectCommandRead |
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
@@ -110,6 +112,7 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
+	GpuProfNote(GpuProfBarrier); // PERF-INSTR
 	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
@@ -118,6 +121,7 @@ void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sou
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
 	EXIT_IF(vk_buffer == nullptr || !destination_stages);
+	GpuProfNote(GpuProfBarrier); // PERF-INSTR
 	const auto barrier = MakeShaderWriteHazardDependency();
 	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
@@ -125,6 +129,7 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
+	GpuProfNote(GpuProfBarrier); // PERF-INSTR
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,
 	                          vk::PipelineStageFlagBits::eComputeShader |

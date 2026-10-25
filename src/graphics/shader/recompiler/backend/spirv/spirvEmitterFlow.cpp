@@ -683,7 +683,27 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	return EmitPushDataLoad(state, ConstantU32(state, index));
+	const auto push_dword = [&](uint32_t dword) {
+		return EmitPushDataLoad(state, ConstantU32(state, dword));
+	};
+	const auto result = push_dword(index);
+	// Indirect draws whose record the GPU wrote pass the parameters' device address instead.
+	const auto flagged = Binary(
+	    state, spv::OpINotEqual, TypeBool(state),
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), push_dword(3),
+	           ConstantU32(state, IR::PushData::MeshDrawIndirectFlag)),
+	    ConstantU32(state, 0));
+	return EmitValueOrDefaultIfCondition(state, flagged, TypeU32(state), result, [&] {
+		const auto base    = PackU64(state, push_dword(4), push_dword(5));
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), base,
+		                            ConstantU64(state, index * 4u));
+		const auto pointer =
+		    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		return value;
+	});
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
